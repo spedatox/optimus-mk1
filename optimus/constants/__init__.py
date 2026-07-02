@@ -1,1 +1,0 @@
-# optimus/constants package

@@ -1,98 +1,183 @@
-"""PowerShellTool — execute PowerShell commands (Windows/cross-platform)."""
+"""
+tools/powershell_tool/powershell_tool.py — core port of src/tools/PowerShellTool/PowerShellTool.tsx
+
+Execute a PowerShell command and capture stdout/stderr with a timeout.
+
+Porting notes (core execution; deep machinery is RE-ENTRY):
+  - The ~7800 lines of powershellSecurity / powershellPermissions / pathValidation
+    / readOnlyValidation / gitSafety / sandbox gating → RE-ENTRY. The query loop's
+    can_use_tool is the outer permission gate; check_permissions returns 'ask' so
+    shell commands prompt by default (fail-safe).
+  - run_in_background / auto-backgrounding / output persistence → RE-ENTRY (runs
+    foreground here). dangerouslyDisableSandbox accepted but unused.
+  - Output is truncated to max_result_size_chars (30K).
+  - Uses pwsh if available, else powershell.exe (Windows); falls back to a POSIX
+    shell only if neither exists (so the tool degrades rather than hard-fails).
+"""
 from __future__ import annotations
+
 import asyncio
+import os
 import shutil
-from typing import Any
-from optimus.tool import Tool, ToolUseContext, ValidationResult
+from typing import Any, Optional
 
-POWERSHELL_TOOL_NAME = "PowerShell"
+from optimus.Tool import (
+    PermissionResult,
+    ToolResult,
+    ToolUseContext,
+    ValidationResult,
+    build_tool,
+)
+from optimus.tools.powershell_tool.prompt import (
+    DEFAULT_TIMEOUT_MS,
+    MAX_TIMEOUT_MS,
+    POWERSHELL_TOOL_NAME,
+    get_powershell_description,
+)
 
-DEFAULT_TIMEOUT_MS = 120_000
-MAX_TIMEOUT_MS = 600_000
-MAX_OUTPUT_BYTES = 100 * 1024  # 100 KB
+_MAX_OUTPUT_CHARS = 30_000
 
-INPUT_SCHEMA: dict[str, Any] = {
+_INPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "command": {
-            "type": "string",
-            "description": "The PowerShell command to execute.",
-        },
-        "timeout": {
-            "type": "number",
-            "description": f"Timeout in ms (max {MAX_TIMEOUT_MS}). Default {DEFAULT_TIMEOUT_MS}.",
-        },
-        "description": {
-            "type": "string",
-            "description": "Short description of what the command does.",
-        },
+        "command": {"type": "string", "description": "The PowerShell command to execute"},
+        "timeout": {"type": "number", "description": f"Optional timeout in milliseconds (max {MAX_TIMEOUT_MS})"},
+        "description": {"type": "string", "description": "Clear, concise description of what this command does in active voice."},
+        "run_in_background": {"type": "boolean", "description": "Set to true to run this command in the background."},
+        "dangerouslyDisableSandbox": {"type": "boolean", "description": "Override sandbox mode and run without sandboxing."},
     },
     "required": ["command"],
+    "additionalProperties": False,
 }
 
-DESCRIPTION = """\
-Execute a PowerShell command and return its output.
-Use for Windows-specific operations, file management, and system administration.
-"""
 
-_PS_EXECUTABLES = ["pwsh", "powershell"]
-
-
-def _find_powershell() -> str | None:
-    for name in _PS_EXECUTABLES:
-        path = shutil.which(name)
-        if path:
-            return path
-    return None
+def _powershell_invocation(command: str) -> list[str]:
+    pwsh = shutil.which("pwsh")
+    if pwsh:
+        return [pwsh, "-NoProfile", "-NonInteractive", "-Command", command]
+    powershell = shutil.which("powershell")
+    if powershell:
+        return [powershell, "-NoProfile", "-NonInteractive", "-Command", command]
+    # Last resort so the tool degrades instead of hard-failing off Windows.
+    shell = os.environ.get("SHELL") or "/bin/sh"
+    return [shell, "-c", command]
 
 
-class PowerShellTool(Tool):
-    name: str = POWERSHELL_TOOL_NAME
-    description: str = DESCRIPTION
-    input_schema: dict[str, Any] = INPUT_SCHEMA
+def _truncate(text: str) -> str:
+    if len(text) <= _MAX_OUTPUT_CHARS:
+        return text
+    head = _MAX_OUTPUT_CHARS - 200
+    return text[:head] + f"\n\n[Output truncated — exceeded {_MAX_OUTPUT_CHARS} characters]"
 
-    async def check_permissions(self, input_data: dict[str, Any], ctx: ToolUseContext) -> ValidationResult:
-        from optimus.utils.permissions.permissions import has_permissions_to_use_tool
-        return await has_permissions_to_use_tool(self, input_data, ctx)
 
-    async def call(self, input_data: dict[str, Any], ctx: ToolUseContext) -> list[dict[str, Any]]:
+@build_tool
+class PowerShellTool:
+    name = POWERSHELL_TOOL_NAME
+    search_hint = "execute Windows PowerShell commands"
+    max_result_size_chars = _MAX_OUTPUT_CHARS
+    strict = True
+    input_schema = _INPUT_SCHEMA
+
+    async def description(self, input: Optional[dict[str, Any]] = None, options: Optional[dict[str, Any]] = None) -> str:
+        if input and input.get("description"):
+            return input["description"]
+        return "Runs a PowerShell command"
+
+    async def prompt(self, options: Optional[dict[str, Any]] = None) -> str:
+        return get_powershell_description()
+
+    def is_read_only(self, input: dict[str, Any]) -> bool:
+        return False
+
+    def is_concurrency_safe(self, input: dict[str, Any]) -> bool:
+        return False
+
+    def to_auto_classifier_input(self, input: dict[str, Any]) -> str:
+        return input.get("command", "")
+
+    def get_activity_description(self, input: Optional[dict[str, Any]] = None) -> Optional[str]:
+        if input and input.get("description"):
+            return input["description"]
+        return "Running command"
+
+    async def check_permissions(self, input: dict[str, Any], context: ToolUseContext) -> PermissionResult:
+        # Fail-safe: shell execution prompts by default (RE-ENTRY: full command
+        # semantics / allowlist matching from powershellPermissions.ts).
+        return PermissionResult(behavior="ask", updated_input=input,
+                                message="Run this PowerShell command?")
+
+    async def validate_input(self, input: dict[str, Any], context: ToolUseContext) -> ValidationResult:
+        if not input.get("command", "").strip():
+            return ValidationResult.fail("Command must not be empty.", error_code=1)
+        return ValidationResult.ok()
+
+    async def call(
+        self,
+        input: dict[str, Any],
+        context: ToolUseContext,
+        can_use_tool: Any = None,
+        parent_message: Any = None,
+        on_progress: Any = None,
+    ) -> ToolResult:
+        command = input["command"]
+        timeout_ms = min(input.get("timeout") or DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS)
+
         from optimus.utils.cwd import get_cwd
 
-        command: str = input_data["command"]
-        timeout_ms: float = float(input_data.get("timeout") or DEFAULT_TIMEOUT_MS)
-        timeout_s = min(max(timeout_ms / 1000.0, 1.0), MAX_TIMEOUT_MS / 1000.0)
-
-        ps_path = _find_powershell()
-        if ps_path is None:
-            return [{"type": "text", "text": "Error: PowerShell not found on this system."}]
-
-        cwd = get_cwd()
+        argv = _powershell_invocation(command)
         try:
             proc = await asyncio.create_subprocess_exec(
-                ps_path, "-NonInteractive", "-Command", command,
-                cwd=cwd,
+                *argv,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                cwd=get_cwd(),
             )
+        except OSError as e:
+            return ToolResult(
+                data={"stdout": "", "stderr": f"Failed to launch shell: {e}", "interrupted": False}
+            )
+
+        interrupted = False
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_ms / 1000)
+        except asyncio.TimeoutError:
+            interrupted = True
             try:
-                stdout_b, stderr_b = await asyncio.wait_for(
-                    proc.communicate(), timeout=timeout_s
-                )
-            except asyncio.TimeoutError:
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-                return [{"type": "text", "text": f"Error: command timed out after {timeout_s:.0f}s."}]
-        except Exception as exc:
-            return [{"type": "text", "text": f"Error executing PowerShell: {exc}"}]
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            stdout_b, stderr_b = b"", b""
+        except asyncio.CancelledError:
+            interrupted = True
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            raise
 
-        stdout = stdout_b[-MAX_OUTPUT_BYTES:].decode("utf-8", errors="replace")
-        stderr = stderr_b[-MAX_OUTPUT_BYTES:].decode("utf-8", errors="replace")
-        output = "\n".join(filter(None, [stdout, stderr]))
-        if not output:
-            output = f"(exit code {proc.returncode})"
-        return [{"type": "text", "text": output}]
+        stdout = _truncate(stdout_b.decode("utf-8", errors="replace"))
+        stderr = _truncate(stderr_b.decode("utf-8", errors="replace"))
+        if interrupted and not stderr:
+            stderr = f"Command timed out after {timeout_ms}ms"
 
+        return ToolResult(
+            data={
+                "stdout": stdout,
+                "stderr": stderr,
+                "interrupted": interrupted,
+                "returnCode": proc.returncode,
+            }
+        )
 
-powershell_tool = PowerShellTool()
+    def map_tool_result_to_tool_result_block_param(self, data: Any, tool_use_id: str) -> dict[str, Any]:
+        parts = []
+        if data.get("stdout"):
+            parts.append(data["stdout"])
+        if data.get("stderr"):
+            parts.append(data["stderr"])
+        content = "\n".join(parts).strip() or "(no output)"
+        is_error = bool(data.get("interrupted")) or (data.get("returnCode") not in (0, None))
+        block: dict[str, Any] = {"tool_use_id": tool_use_id, "type": "tool_result", "content": content}
+        if is_error:
+            block["is_error"] = True
+        return block

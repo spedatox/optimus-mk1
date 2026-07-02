@@ -1,174 +1,187 @@
-# OPTIMUS MARK I — CLAUDE.md
+# OPTIMUS MARK I
+## Python port of Claude Code (TypeScript/Bun)
 
-## Mission
-
-Perform a **complete, 1:1, feature-identical Python port** of the Claude Code TypeScript/Bun codebase in `claude_code.zip`. The result is **OPTIMUS Mark I** — a fully autonomous Python-native agentic coding engine.
-
-This is a forensic translation. Same architecture, same abstractions, same behavior, same capabilities — expressed idiomatically in Python. Not a rewrite. Not a reimagining. A port.
+**Author:** Ahmet Erol Bayrak
 
 ---
 
-## How to Work
+## What this project is
 
-**The source is your specification.** Before implementing anything, extract and read the TypeScript source:
-
-```bash
-unzip claude_code.zip -d claude_code_src/
-```
-
-For every file you port:
-1. Read the TypeScript source file completely
-2. Understand what it does and how it fits into the system
-3. Cross-reference with already-ported Python files for consistency
-4. Then implement
-
-When in doubt about any behavior, type, interface, or relationship — **go back to the source.** Do not guess. Do not infer from the filename alone. Read the file.
+A 1:1 Python port of Claude Code. Every TypeScript file becomes a Python file.
+Same functions. Same features. Same behaviour. Language differences are acceptable
+as long as both variants do the same thing the same way.
 
 ---
 
-## Non-Negotiables
-
-- **Every file gets ported.** If it exists in `src/`, it exists in `optimus/`. No exceptions.
-- **No stubs.** A function with just `pass` is unacceptable. Every function must be fully implemented.
-- **Read before write.** No implementing a module without reading its TypeScript source first.
-- **Cross-reference constantly.** Before writing any module, check what already exists in the current `optimus/` codebase. Build on what's there. Stay consistent.
-- **Idiomatic Python.** Translate intent, not syntax. Use `dataclasses`, `Protocol`, `TypedDict`, `asyncio`, `abc`, and `typing` as appropriate.
-- **Test as you go.** After each module, write and run tests confirming behavioral equivalence with the TypeScript original.
-- **Document deviations.** Any Python-specific adaptation or deliberate departure from the TypeScript source goes in `PORTING_NOTES.md` with justification.
-
----
-
-## ⛔ The Line-Count Rule — MANDATORY
-
-Every ported file must be cross-checked against the TypeScript original by line count.
-
-**A Python file that is dramatically shorter than its TypeScript source is a red flag and almost certainly a stub or a partial port.** Before committing any file, verify:
+## Source
 
 ```
-TS source lines  →  Python lines
--------------------------------------
-bashSecurity.ts    2592  →  bash_security.py    must be ≥ 400 non-comment lines
-bashPermissions.ts 2621  →  bash_permissions.py must be ≥ 500 non-comment lines
-pathValidation.ts  1990  →  path_validation.py  must be ≥ 350 non-comment lines
-commands.ts        1339  →  commands.py         must be ≥ 250 non-comment lines
+claude_code_src/src/   ← the TypeScript source. This is the spec.
 ```
 
-Python is more concise than TypeScript. But if a 2000-line TS file produces an 80-line Python file, that is not a port — it is a skeleton. The minimum acceptable ratio is roughly **1 Python line per 4–5 TS lines** for large files (types, JSDoc, braces inflate TS). If the ratio is worse than 1:8, treat it as incomplete and go back to the source.
+When in doubt: read the source. The source is always right.
 
 ---
 
-## ⛔ The "No Thin Wrapper" Rule — MANDATORY
+## Rules
 
-Do not write a thin wrapper that:
-- Imports 2–3 things and re-exports them
-- Has a class with `pass` or `...` as the body
-- Has methods that return `None` without performing the actual logic
-- Has functions that raise `NotImplementedError`
-- Delegates everything to `try: from ... import X; X()` without the actual logic
+### 1. Read before you write
+Read the full TypeScript file before writing a single line of Python.
+Understand what every function does. Then port it.
 
-Every function must contain the **real logic** from the TypeScript source. If a dependency module hasn't been ported yet, either port it first or write a clearly-marked stub with a `# TODO: port <filename>.ts` comment and file a note in `PORTING_NOTES.md`. Do not silently omit logic.
+### 2. Same functions, same features
+Every exported function, class, and constant in the TS file must have
+a Python equivalent that does the same thing.
+
+Acceptable omissions (document in PORTING_NOTES.md):
+- React render methods (no UI layer yet) — keep as `return None` stubs
+- Analytics / telemetry (`logEvent`) — drop entirely, they are no-op
+- Feature-gated code (`feature('X') → False`) — omit the branch body,
+  leave a comment marking where it plugs in when ported
+
+### 3. No stubs
+A stub is a function that exists but does nothing:
+```python
+# WRONG
+async def call(self, args, context): pass
+async def call(self, args, context): return None
+async def call(self, args, context): ...
+```
+Every function must have real logic that matches the TS source.
+
+### 4. Line ratio check
+Before moving to the next file, check:
+
+```
+TS lines / Python lines
+```
+
+If the ratio is worse than 1:5 (e.g. 500 TS lines → less than 100 Python lines),
+go back and finish it.
+
+Legitimate compression sources (do not pad artificially):
+- TypeScript import blocks → fewer Python imports
+- TypeScript generic type machinery → not needed in Python
+- JSDoc verbosity → Python docstrings are more concise
+- `export type` re-exports → not needed
+
+### 5. One file at a time
+No agents. No parallelism. Port one file here, verify it, then move on.
+The user reviews each file before we continue.
+
+### 6. Dependency stubs
+When a function depends on a module not yet ported, write a minimal
+stub with a comment:
+```python
+# Stub — mirrors getMessagesAfterCompactBoundary() from utils/messages.ts
+# Replace when messages.ts is ported.
+def get_messages_after_compact_boundary(messages): return messages
+```
+
+### 7. TUI rules (Textual)
+The TUI layer replaces Claude Code's React/Ink UI entirely.
+These rules govern the `optimus/tui/` subtree:
+
+- **Framework:** Textual (Python) — not Ink (TypeScript/React).
+- **Theme:** JARVIS blue. Background `#050a1e`, accent `#00d4ff`, text `#e0e8ff`.
+  All colours live in `optimus/tui/theme.tcss`. Never hardcode colours in Python.
+- **No blocking in widgets.** Widget handlers must be sync or use `asyncio.create_task()`.
+  Never `await` inside an `on_*` handler directly.
+- **Streaming:** append text with `MessageWidget.append_text()` per delta;
+  call `finish_streaming()` once the turn ends.
+- **Permissions:** every tool call that is not pre-approved must go through
+  `PermissionModal`. Never silently skip or auto-approve without user consent.
+- **Component ownership:**
+  - `MessageList` owns scroll and message history display.
+  - `InputBar` owns text entry, history navigation, slash-command overlay.
+  - `StatusBar` owns model / token / cost / branch / mode display.
+  - `ReplScreen` owns the query loop and wires all components together.
+  - `OptimusApp` owns screen lifecycle only.
+- **CSS location:** all widget-local CSS goes in `DEFAULT_CSS`; global theming
+  goes in `theme.tcss`. Do not mix them.
+- **Refresh strategy:** prefer `reactive` watchers over `refresh(recompose=True)`.
+  Use `recompose=True` only when child widget count changes (e.g. adding a tool panel).
 
 ---
 
-## ⛔ The "Read the Whole File" Rule — MANDATORY
-
-Before implementing any module:
-
-1. Read the **entire** TypeScript source file from line 1 to the last line
-2. Count the exported functions — every one must have a Python equivalent
-3. Note all constants, all enums, all type aliases — every one must be ported
-4. Note the imports — every dependency that contains logic must either be already ported or explicitly stubs
-
-Partial reads lead to partial ports. If a file is 3000 lines, read all 3000 lines before writing a single line of Python.
-
----
-
-## ⛔ The Status+README Maintenance Rule — MANDATORY
-
-After every session that adds or changes files:
-
-1. **Update `STATUS.md`** — move completed items to "What's Done", update the file count, update "What's Next" to reflect only items that are actually not yet ported
-2. **Update `README.md`** — keep the "What's built" table and roadmap current
-
-The "What's Next" section must **never** list items that are already done. Listing `bash_tool.py` as pending when it already exists, or listing `bash_security.py` as needed when it was just written — that is a lie in the documentation and makes it impossible to track real progress.
-
----
-
-## ⛔ The "No False Progress" Rule — MANDATORY
-
-Do not claim a module is "done" if:
-- It has unexplained `pass` statements in non-exception-handler positions
-- It has functions that do nothing (no side effects, no return value, no logic)
-- It delegates to modules that don't exist yet without documenting that
-- It silently ignores entire sections of the TypeScript source
-
-When a module has a genuine dependency that hasn't been ported yet, that dependency is a blocker. Document it. Don't silently omit the logic that depends on it.
-
----
-
-## Technology Mapping
-
-Resolve TypeScript dependencies to their Python equivalents:
+## Tech mapping
 
 | TypeScript | Python |
 |---|---|
-| Bun runtime | Python 3.12+ |
-| TypeScript strict types | `typing` + `mypy --strict` |
-| React + Ink | Textual |
-| Zod | Pydantic v2 |
-| Commander.js | Click or Typer |
-| `@anthropic-ai/sdk` | `anthropic` Python SDK |
-| `@modelcontextprotocol/sdk` | `mcp` Python SDK |
-| `EventEmitter` | `pyee.AsyncIOEventEmitter` |
-| `chalk` | `rich` |
-| `async/await` | `asyncio` |
-| `Promise.all` | `asyncio.gather` |
-| `Map` / `Set` / `Record` | `dict` / `set` |
-| `z.object({})` | Pydantic `BaseModel` |
+| `async function*` generator | `async def` with `yield` |
+| `yield*` | `async for x in gen: yield x` |
+| Zod schema | Pydantic v2 `BaseModel` or `dict` |
+| `z.infer<Input>` | `dict[str, Any]` |
+| `camelCase` | `snake_case` |
+| `AbortController` | `asyncio.Event` |
+| `Map<K,V>` | `dict[K, V]` |
+| `readonly T[]` | `list[T]` |
+| `feature('X')` | `False` (always) |
+| Analytics / telemetry | Drop entirely |
 | `index.ts` | `__init__.py` |
-| `camelCase` files/functions | `snake_case` |
-| `feature('FLAG')` Bun DCE | `False` constant (feature flags are off in Python port) |
-| `logEvent(...)` analytics | no-op / omit |
-
-When you encounter a TypeScript dependency not in this table, find its Python equivalent yourself. There is always one.
-
----
-
-## Structure
-
-Mirror `src/` exactly as `optimus/`. Every subdirectory becomes a subpackage with `__init__.py`. Every `.ts` / `.tsx` file becomes a `.py` file with the name converted to `snake_case`.
-
-Discover the full structure yourself by inspecting the source:
-
-```bash
-find claude_code_src/src -type d | sort
-find claude_code_src/src -type f -name "*.ts" | sort
-```
+| React render methods | `return None` stub |
+| React/Ink components | Textual `Widget` subclasses |
+| React hooks (`useQuery`, `useApp`) | Methods on `ReplScreen` |
+| `EventEmitter` | `pyee.AsyncIOEventEmitter` |
+| `Promise.all` | `asyncio.gather` |
 
 ---
 
-## What Already Exists
+## File order
 
-Read `STATUS.md` before every session. It is the authoritative record of what has and has not been ported. Do not re-port things that exist. Do not claim things are done when they are not.
+Work through files in dependency order — port what a file depends on
+before porting the file itself.
 
-The "What Already Exists" list in this file is intentionally kept short — go read `STATUS.md` for the real inventory.
+### Core (done ✅)
+1. `src/Tool.ts`   → `optimus/Tool.py` ✅
+2. `src/query.ts`  → `optimus/query.py` ✅
+3. `src/index.ts`  → `optimus/__main__.py` ✅
+4. `src/main.tsx`  → `optimus/main.py` ✅
+
+### Constants & utilities (done ✅)
+5. `src/constants/*.ts` → `optimus/constants.py` ✅
+6. `src/utils/envUtils.ts` → `optimus/env_utils.py` ✅
+7. `src/context.ts` → `optimus/context.py` ✅
+8. `src/prompts.ts` + `systemPromptSections.ts` → `optimus/prompts.py` ✅
+
+### TUI layer (done ✅)
+9. Theme CSS → `optimus/tui/theme.tcss` ✅
+10. `components/Message.tsx` + `VirtualMessageList.tsx` → `optimus/tui/components/messages.py` ✅
+11. `components/PromptInput/*.tsx` → `optimus/tui/components/input_bar.py` ✅
+12. `components/StatusBar.tsx` → `optimus/tui/components/status_bar.py` ✅
+13. `components/permissions/*.tsx` → `optimus/tui/components/permission.py` ✅
+14. `App.tsx` + hooks → `optimus/tui/screens/repl.py` ✅
+15. Root app → `optimus/tui/app.py` ✅
+
+### Next targets
+- `src/utils/claudeMd.ts`   → `optimus/claudemd.py`
+- `src/bootstrap/state.ts`  → `optimus/bootstrap/state.py`
+- `src/utils/config.ts`     → `optimus/utils/config.py`
+- `src/services/mcp/`       → `optimus/services/mcp/`
+- `src/tools/`              → `optimus/tools/`
+
+### Tools ported so far
+Glob, Grep, FileRead, FileWrite, FileEdit, PowerShell, TodoWrite, WebFetch,
+WebSearch, NotebookEdit, **AskUserQuestion** ✅ (11/40). Remaining: AgentTool,
+Bash, Brief, Config, EnterPlanMode, EnterWorktree, ExitPlanMode, ExitWorktree,
+LSP, ListMcpResources, MCP, McpAuth, REPL, ReadMcpResource, RemoteTrigger,
+ScheduleCron, SendMessage, Skill, Sleep, SyntheticOutput, TaskCreate/Get/List/
+Output/Stop/Update, TeamCreate, TeamDelete, ToolSearch.
 
 ---
 
-## Definition of Done
+## After each file
 
-- Every file in `src/` has a Python equivalent in `optimus/`
-- `mypy --strict optimus/` passes with 0 errors
-- Full test suite passes
-- `optimus` CLI launches, `--help` works, REPL mode is functional
-- All tools registered and callable
-- All slash commands registered
-- MCP, agent/swarm, history — all functional
-- `PORTING_NOTES.md` is complete
-- Zero unimplemented stubs remain
-- `STATUS.md` accurately reflects the above
+1. State the TS line count and Python line count
+2. State the ratio
+3. Explain any legitimate compression
+4. Wait for user review before continuing
 
 ---
 
-*OPTIMUS Mark I — Python port of Claude Code*
-*Author: Ahmet Erol Bayrak*
+## PORTING_NOTES.md
+
+Document every deviation from strict 1:1 in PORTING_NOTES.md:
+- Which file
+- What was omitted or changed
+- Why

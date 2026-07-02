@@ -1,57 +1,56 @@
 """
-Current working directory management with per-async-context overrides.
-Mirrors src/utils/cwd.ts
+utils/cwd.py — port of src/utils/cwd.ts
 
-Uses contextvars (Python's AsyncLocalStorage equivalent) to allow concurrent
-agents to each see their own working directory without interfering.
+Current-working-directory resolution with per-async-context override.
+
+Porting notes:
+  - AsyncLocalStorage<string> → contextvars.ContextVar[Optional[str]].
+    Both propagate a value to async descendants while isolating concurrent
+    contexts: asyncio.create_task() copies the current context at creation,
+    so a task spawned inside run_with_cwd_override() keeps the override even
+    after the outer call returns and resets it — matching AsyncLocalStorage.run.
+  - getCwdState / getOriginalCwd come from bootstrap/state.
 """
 from __future__ import annotations
 
 from contextvars import ContextVar
+from typing import Callable, Optional, TypeVar
 
-# Per-async-context CWD override (None = use global state)
-_cwd_override: ContextVar[str | None] = ContextVar("_cwd_override", default=None)
+from optimus.bootstrap.state import get_cwd_state, get_original_cwd
+
+T = TypeVar("T")
+
+_cwd_override_storage: ContextVar[Optional[str]] = ContextVar(
+    "cwd_override", default=None
+)
 
 
-def run_with_cwd_override(cwd: str, fn: Any) -> Any:
+def run_with_cwd_override(cwd: str, fn: Callable[[], T]) -> T:
     """
     Run `fn` with an overridden working directory for the current async context.
-    All calls to pwd()/get_cwd() within fn (and its async descendants) will
-    return `cwd` instead of the global one.
+    All pwd()/get_cwd() calls within fn (and its async descendants) return the
+    override instead of the global cwd. Enables concurrent agents to each see
+    their own working directory without affecting each other.
     """
-    token = _cwd_override.set(cwd)
+    token = _cwd_override_storage.set(cwd)
     try:
         return fn()
     finally:
-        _cwd_override.reset(token)
-
-
-async def run_with_cwd_override_async(cwd: str, coro: Any) -> Any:
-    """Async variant of run_with_cwd_override."""
-    token = _cwd_override.set(cwd)
-    try:
-        return await coro
-    finally:
-        _cwd_override.reset(token)
+        _cwd_override_storage.reset(token)
 
 
 def pwd() -> str:
-    """Return the current working directory for this async context."""
-    override = _cwd_override.get()
-    if override is not None:
-        return override
-    from optimus.bootstrap.state import get_cwd_state
-    return get_cwd_state()
+    """Get the current working directory (override if set, else global state)."""
+    store = _cwd_override_storage.get()
+    return store if store is not None else get_cwd_state()
 
 
 def get_cwd() -> str:
-    """Return the current working directory, falling back to original cwd."""
+    """
+    Get the current working directory, falling back to the original working
+    directory if the current one is not available.
+    """
     try:
         return pwd()
     except Exception:
-        from optimus.bootstrap.state import get_original_cwd
         return get_original_cwd()
-
-
-# Avoid circular import at module level
-from typing import Any  # noqa: E402

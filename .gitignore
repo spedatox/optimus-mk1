@@ -44,3 +44,10 @@ claude_code_src/
 # OS
 .DS_Store
 Thumbs.db
+
+# Node.js / Electron (heartbreaker)
+node_modules/
+out/
+*.tsbuildinfo
+dist-electron/
+release/

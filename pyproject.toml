@@ -7,7 +7,6 @@ name = "optimus"
 version = "0.1.0"
 description = "OPTIMUS Mark I — Python port of Claude Code by Anthropic"
 authors = ["Ahmet Erol Bayrak"]
-readme = "README.md"
 packages = [{include = "optimus"}]
 
 [tool.poetry.scripts]
@@ -41,7 +40,7 @@ websockets = "^12.0"
 httpx = "^0.27"
 anyio = "^4.0"
 
-[tool.poetry.dev-dependencies]
+[tool.poetry.group.dev.dependencies]
 pytest = "^8.0"
 pytest-asyncio = "^0.23"
 mypy = "^1.9"

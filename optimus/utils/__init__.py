@@ -1,1 +1,1 @@
-# optimus/utils package
+"""utils package."""

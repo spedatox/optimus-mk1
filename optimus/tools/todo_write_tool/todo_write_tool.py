@@ -1,60 +1,103 @@
-"""TodoWriteTool — structured task list management. Mirrors src/tools/TodoWriteTool/TodoWriteTool.ts"""
+"""
+tools/todo_write_tool/todo_write_tool.py — port of src/tools/TodoWriteTool/TodoWriteTool.ts
+
+Maintains a structured, session-scoped task list. Each item has content
+(imperative), activeForm (present continuous), and status (pending |
+in_progress | completed).
+
+Porting notes:
+  - appState.todos[key] → bootstrap state todo store (get_todos/set_todos),
+    keyed by agent_id ?? session_id.
+  - When the whole list is completed the stored list is cleared (matches TS).
+  - feature('VERIFICATION_AGENT') nudge → omitted (feature off).
+  - isTodoV2 gating → is_enabled returns True (V2 off).
+"""
 from __future__ import annotations
-from typing import Any, Literal
-from optimus.tool import Tool, ToolUseContext, ValidationResult
 
-TODO_WRITE_TOOL_NAME = "TodoWrite"
+from typing import Any, Optional
 
-# In-memory todo list (per session)
-_todos: list[dict[str, Any]] = []
+from optimus.bootstrap.state import get_session_id, get_todos, set_todos
+from optimus.Tool import PermissionResult, ToolResult, ToolUseContext, ValidationResult, build_tool
+from optimus.tools.todo_write_tool.prompt import DESCRIPTION, PROMPT, TODO_WRITE_TOOL_NAME
 
-INPUT_SCHEMA: dict[str, Any] = {
+_TODO_ITEM = {
     "type": "object",
     "properties": {
-        "todos": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string"},
-                    "content": {"type": "string"},
-                    "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
-                    "priority": {"type": "string", "enum": ["high", "medium", "low"]},
-                },
-                "required": ["id", "content", "status", "priority"],
-            },
-            "description": "The updated todo list.",
-        },
+        "content": {"type": "string", "description": "Imperative form, e.g. 'Run tests'"},
+        "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+        "activeForm": {"type": "string", "description": "Present continuous form, e.g. 'Running tests'"},
     },
-    "required": ["todos"],
+    "required": ["content", "status", "activeForm"],
+    "additionalProperties": False,
 }
 
-DESCRIPTION = """\
-Create and manage a structured task list for tracking progress on complex tasks.
-Use this to plan multi-step work, track what's been done, and communicate progress.
-Mark tasks as pending, in_progress, or completed.
-Only one task should be in_progress at a time.
-"""
+_INPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "todos": {"type": "array", "items": _TODO_ITEM, "description": "The updated todo list"},
+    },
+    "required": ["todos"],
+    "additionalProperties": False,
+}
 
 
-class TodoWriteTool(Tool):
-    name: str = TODO_WRITE_TOOL_NAME
-    description: str = DESCRIPTION
-    input_schema: dict[str, Any] = INPUT_SCHEMA
+@build_tool
+class TodoWriteTool:
+    name = TODO_WRITE_TOOL_NAME
+    search_hint = "manage the session task checklist"
+    max_result_size_chars = 100_000
+    strict = True
+    should_defer = True
+    input_schema = _INPUT_SCHEMA
 
-    async def check_permissions(self, input_data: dict[str, Any], ctx: ToolUseContext) -> ValidationResult:
-        return ValidationResult(allowed=True)
+    async def description(self, input: Optional[dict[str, Any]] = None, options: Optional[dict[str, Any]] = None) -> str:
+        return DESCRIPTION
 
-    async def call(self, input_data: dict[str, Any], ctx: ToolUseContext) -> list[dict[str, Any]]:
-        global _todos
-        _todos = input_data.get("todos", [])
-        count = len(_todos)
-        done = sum(1 for t in _todos if t.get("status") == "completed")
-        return [{"type": "text", "text": f"Todos updated: {done}/{count} completed."}]
+    async def prompt(self, options: Optional[dict[str, Any]] = None) -> str:
+        return PROMPT
 
+    def user_facing_name(self, input: Optional[dict[str, Any]] = None) -> str:
+        return ""
 
-def get_todos() -> list[dict[str, Any]]:
-    return list(_todos)
+    def is_read_only(self, input: dict[str, Any]) -> bool:
+        # Updates session state, not the filesystem — safe/concurrency-neutral.
+        return True
 
+    def to_auto_classifier_input(self, input: dict[str, Any]) -> str:
+        return f"{len(input.get('todos', []))} items"
 
-todo_write_tool = TodoWriteTool()
+    async def validate_input(self, input: dict[str, Any], context: ToolUseContext) -> ValidationResult:
+        for item in input.get("todos", []):
+            if not item.get("content"):
+                return ValidationResult.fail("Content cannot be empty", error_code=1)
+            if not item.get("activeForm"):
+                return ValidationResult.fail("Active form cannot be empty", error_code=2)
+            if item.get("status") not in ("pending", "in_progress", "completed"):
+                return ValidationResult.fail("Invalid status", error_code=3)
+        return ValidationResult.ok()
+
+    async def check_permissions(self, input: dict[str, Any], context: ToolUseContext) -> PermissionResult:
+        return PermissionResult(behavior="allow", updated_input=input)
+
+    async def call(
+        self,
+        input: dict[str, Any],
+        context: ToolUseContext,
+        can_use_tool: Any = None,
+        parent_message: Any = None,
+        on_progress: Any = None,
+    ) -> ToolResult:
+        todos = input["todos"]
+        todo_key = context.agent_id or get_session_id()
+        old_todos = get_todos(todo_key)
+        all_done = len(todos) > 0 and all(t["status"] == "completed" for t in todos)
+        new_todos = [] if all_done else todos
+        set_todos(todo_key, new_todos)
+        return ToolResult(data={"oldTodos": old_todos, "newTodos": todos})
+
+    def map_tool_result_to_tool_result_block_param(self, data: Any, tool_use_id: str) -> dict[str, Any]:
+        content = (
+            "Todos have been modified successfully. Ensure that you continue to use the "
+            "todo list to track your progress. Please proceed with the current tasks if applicable"
+        )
+        return {"tool_use_id": tool_use_id, "type": "tool_result", "content": content}

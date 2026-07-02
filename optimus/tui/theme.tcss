@@ -1,0 +1,475 @@
+/* ============================================================
+   OPTIMUS MARK I — Claude Code Dark Theme (exact replica)
+   Colors from: claude_code_src/src/utils/theme.ts darkTheme
+   ============================================================ */
+
+/*
+   Variable reference (all hex conversions of darkTheme RGB values):
+   $claude:           #d77757   rgb(215,119,87)   — Claude orange (primary accent)
+   $text:             #ffffff   rgb(255,255,255)   — White (primary text)
+   $inactive:         #999999   rgb(153,153,153)   — Light gray (dim text)
+   $subtle:           #505050   rgb(80,80,80)      — Very dark gray
+   $success:          #4eba65   rgb(78,186,101)    — Bright green
+   $error:            #ff6b80   rgb(255,107,128)   — Bright red/pink
+   $warning:          #ffc107   rgb(255,193,7)     — Bright amber
+   $user-bg:          #373737   rgb(55,55,55)      — User message background
+   $actions-bg:       #2c323e   rgb(44,50,62)      — Message actions / selection bg
+   $selection:        #264f78   rgb(38,79,120)     — Text selection highlight
+   $bash-bg:          #413c41   rgb(65,60,65)      — Bash block background
+   $prompt-border:    #888888   rgb(136,136,136)   — Input/prompt border
+   $permission:       #b1b9f9   rgb(177,185,249)   — Permission / suggestion blue
+   $plan-mode:        #48968c   rgb(72,150,140)    — Plan mode teal
+   $label-you:        #7ab4e8   rgb(122,180,232)   — "You" label blue
+   $diff-added:       #225c2b   rgb(34,92,43)      — Diff added dark green
+   $diff-removed:     #7a2936   rgb(122,41,54)     — Diff removed dark red
+   $diff-added-word:  #38a660   rgb(56,166,96)     — Diff added word green
+   $diff-removed-word:#b35960   rgb(179,89,107)    — Diff removed word red
+*/
+
+/* ── Root ───────────────────────────────────────────────────── */
+Screen {
+    background: #1a1a1a;
+    color: #ffffff;
+    layers: base overlay notification;
+}
+
+/* ── REPL Screen ────────────────────────────────────────────── */
+ReplScreen {
+    layout: vertical;
+    background: #1a1a1a;
+    layers: base overlay;
+}
+
+/* ── Message list ────────────────────────────────────────────── */
+MessageList {
+    height: 1fr;
+    background: #1a1a1a;
+    border: none;
+    scrollbar-color: #505050;
+    scrollbar-size: 1 1;
+    scrollbar-background: #1a1a1a;
+}
+
+#message-container {
+    background: #1a1a1a;
+    padding: 0;
+    min-height: 100%;
+}
+
+/* ── User messages ───────────────────────────────────────────── */
+/*  Background: userMessageBackground = rgb(55,55,55) = #373737  */
+/*  paddingRight = 1                                              */
+/*  NO label. Claude Code has no "You" label.                     */
+.message-user {
+    background: #373737;
+    margin: 1 0 0 0;
+    padding: 0 1 0 0;
+}
+
+.message-user-content {
+    color: #ffffff;
+    background: #373737;
+}
+
+/* ── Assistant messages ──────────────────────────────────────── */
+/*  No background. No label.                                      */
+/*  Layout: ● (2-col, NoSelect) + Markdown (flex-row)            */
+.message-assistant {
+    background: #1a1a1a;
+    margin: 1 0 0 0;
+    padding: 0;
+}
+
+/* Horizontal row: dot + body */
+.message-assistant-row {
+    height: auto;
+    background: #1a1a1a;
+}
+
+/* The ● dot: exactly 2 columns wide, non-selectable */
+.message-dot {
+    width: 2;
+    min-width: 2;
+    height: auto;
+    color: #ffffff;
+    padding: 0;
+    background: #1a1a1a;
+}
+
+/* The body column containing Markdown + tool panels */
+.message-assistant-body {
+    height: auto;
+    width: 1fr;
+    background: #1a1a1a;
+}
+
+.message-assistant-content {
+    color: #ffffff;
+    background: #1a1a1a;
+    margin: 0;
+    padding: 0;
+}
+
+.message-assistant-content Markdown {
+    background: #1a1a1a;
+    color: #ffffff;
+    margin: 0;
+    padding: 0;
+}
+
+/* Markdown heading colours */
+.message-assistant-content Markdown H1 {
+    color: #ffffff;
+    text-style: bold;
+}
+.message-assistant-content Markdown H2 {
+    color: #d77757;
+    text-style: bold;
+}
+.message-assistant-content Markdown H3 {
+    color: #d77757;
+}
+
+/* ── Thinking block ──────────────────────────────────────────── */
+.thinking-block {
+    margin: 0 0 0 2;
+    padding: 0 1;
+    background: #262626;
+    color: #999999;
+    text-style: italic;
+}
+
+/* ── Tool call panels ────────────────────────────────────────── */
+.tool-panel {
+    height: auto;
+    margin: 0 0 0 2;
+    padding: 0 1;
+    background: #413c41;
+    border-left: thick #b1b9f9;
+}
+
+.tool-panel-header {
+    layout: horizontal;
+    height: 1;
+}
+
+.tool-result-content {
+    color: #ffffff;
+    background: #262626;
+    padding: 0 1;
+    max-height: 10;
+    overflow-y: auto;
+}
+
+.tool-result-success {
+    color: #4eba65;
+}
+
+.tool-result-error {
+    color: #ff6b80;
+}
+
+/* ── Input area ──────────────────────────────────────────────── */
+/*  promptBorder = rgb(136,136,136) = #888888                    */
+/*  > prefix in claude orange (#d77757)                          */
+InputBar {
+    height: 4;
+    background: #1a1a1a;
+    border-top: solid #888888;
+    layout: vertical;
+    padding: 0;
+}
+
+InputBar #input-area {
+    height: 3;
+    padding: 1 0;
+    background: #1a1a1a;
+    layout: horizontal;
+}
+
+InputBar #input-prefix {
+    width: 3;
+    height: 1;
+    color: #d77757;
+    content-align: left middle;
+    background: #1a1a1a;
+}
+
+InputBar Input {
+    border: none;
+    background: #1a1a1a;
+    color: #ffffff;
+    height: 1;
+    width: 1fr;
+    padding: 0 1;
+    margin: 0;
+}
+
+InputBar Input:focus {
+    border: none;
+    background: #1a1a1a;
+    color: #ffffff;
+}
+
+InputBar Input>.input--placeholder {
+    color: #505050;
+    text-style: italic;
+}
+
+InputBar Input>.input--cursor {
+    background: #d77757;
+    color: #000000;
+}
+
+/* ── Status bar ──────────────────────────────────────────────── */
+StatusBar {
+    height: 1;
+    background: #2c323e;
+    layout: horizontal;
+    dock: bottom;
+}
+
+StatusBar Static {
+    height: 1;
+    content-align: left middle;
+    color: #999999;
+}
+
+StatusBar .status-sep {
+    width: 3;
+    content-align: center middle;
+    color: #505050;
+}
+
+StatusBar .status-model {
+    /* Claude orange for model name */
+    color: #d77757;
+    width: auto;
+    min-width: 18;
+}
+
+StatusBar .status-tokens {
+    color: #999999;
+    width: auto;
+    min-width: 12;
+}
+
+StatusBar .status-cost {
+    color: #999999;
+    width: auto;
+    min-width: 9;
+}
+
+StatusBar .status-branch {
+    /* git branch: success green */
+    color: #4eba65;
+    width: auto;
+    min-width: 12;
+}
+
+StatusBar .status-mode {
+    /* permission mode: amber */
+    color: #ffc107;
+    width: auto;
+    min-width: 8;
+}
+
+StatusBar .status-cwd {
+    color: #999999;
+    width: 1fr;
+}
+
+StatusBar .status-session {
+    color: #505050;
+    width: auto;
+    min-width: 10;
+}
+
+/* ── Slash command overlay ───────────────────────────────────── */
+/*  background: #262626, border: #888888                         */
+/*  selected item bg: #2c323e (messageActionsBackground)         */
+/*  selected name color: #d77757 (claude orange)                 */
+SlashOverlay {
+    dock: bottom;
+    margin-bottom: 5;
+    margin-left: 2;
+    width: 62;
+    height: auto;
+    max-height: 16;
+    background: #262626;
+    border: solid #888888;
+    display: none;
+    layer: overlay;
+}
+
+SlashOverlay.visible {
+    display: block;
+}
+
+SlashOverlay .slash-header {
+    background: #1a1a1a;
+    color: #505050;
+    height: 1;
+    padding: 0 1;
+}
+
+SlashOverlay .slash-item {
+    height: 1;
+    padding: 0 1;
+    color: #999999;
+}
+
+SlashOverlay .slash-item--selected {
+    background: #2c323e;
+    color: #ffffff;
+}
+
+SlashOverlay .slash-item--selected .slash-name {
+    color: #d77757;
+}
+
+/* ── Permission dialog ───────────────────────────────────────── */
+PermissionModal {
+    align: center middle;
+    layer: overlay;
+}
+
+DangerousPermissionModal {
+    align: center middle;
+    layer: overlay;
+}
+
+#permission-container {
+    background: #262626;
+    border: double #b1b9f9;
+    width: 70;
+    max-width: 90%;
+    height: auto;
+    max-height: 30;
+    padding: 1 2;
+}
+
+#permission-title {
+    color: #b1b9f9;
+    text-style: bold;
+    text-align: center;
+    margin-bottom: 1;
+}
+
+#permission-tool {
+    color: #d77757;
+    text-style: bold;
+    margin-bottom: 0;
+}
+
+#permission-description {
+    color: #ffffff;
+    margin-bottom: 1;
+}
+
+#permission-content {
+    background: #413c41;
+    border: solid #505050;
+    color: #999999;
+    padding: 0 1;
+    margin-bottom: 1;
+    max-height: 8;
+    overflow-y: auto;
+}
+
+#permission-buttons {
+    layout: horizontal;
+    height: 3;
+    align: center middle;
+}
+
+#permission-buttons Button {
+    margin: 0 1;
+    min-width: 12;
+}
+
+#btn-allow {
+    background: #4eba65;
+    color: #000000;
+    border: none;
+}
+
+#btn-allow:hover {
+    background: #5acc75;
+}
+
+#btn-allow-session {
+    background: #264f78;
+    color: #ffffff;
+    border: none;
+}
+
+#btn-allow-session:hover {
+    background: #b1b9f9;
+    color: #000000;
+}
+
+#btn-deny {
+    background: #2a0a0e;
+    color: #ff6b80;
+    border: solid #ff6b80;
+}
+
+#btn-deny:hover {
+    background: #ff6b80;
+    color: #000000;
+}
+
+/* ── Error / system messages ─────────────────────────────────── */
+.error-message {
+    color: #ff6b80;
+    background: #2a0a0e;
+    border-left: thick #ff6b80;
+    padding: 0 1;
+    margin: 1 0 0 0;
+}
+
+.system-message {
+    color: #999999;
+    text-style: italic;
+    margin: 0 0 0 0;
+    padding: 0 1;
+}
+
+/* ── Diff display ────────────────────────────────────────────── */
+.diff-added {
+    color: #4eba65;
+    background: #225c2b;
+}
+
+.diff-removed {
+    color: #ff6b80;
+    background: #7a2936;
+}
+
+/* ── Scrollbar overrides ─────────────────────────────────────── */
+ScrollBar {
+    background: #1a1a1a;
+    color: #505050;
+}
+
+ScrollBar > .scrollbar--bar {
+    background: #505050;
+    color: #999999;
+}
+
+ScrollBar > .scrollbar--bar:hover {
+    background: #888888;
+}
+
+/* ── Notification toast ──────────────────────────────────────── */
+.notification {
+    layer: notification;
+    dock: bottom;
+    background: #2c323e;
+    border: solid #888888;
+    color: #ffffff;
+    padding: 0 2;
+    height: 1;
+    width: auto;
+}

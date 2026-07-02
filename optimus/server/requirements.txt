@@ -1,0 +1,9 @@
+# Optimus Mark I backend (optimus/server)
+fastapi>=0.110
+uvicorn>=0.27
+pyjwt>=2.8
+sse-starlette>=2.0
+anthropic>=0.40
+# shared by the agent core / tools
+pyyaml>=6.0
+pathspec>=0.12
