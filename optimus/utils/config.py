@@ -242,14 +242,20 @@ def _compute_trust_dialog_accepted() -> bool:
         return True
 
     # Walk from cwd up through parents (trust is inherited by children).
-    current_path = normalize_path_for_config_key(get_cwd())
+    # Walk the REAL absolute path and normalize only for the key lookup:
+    # normalized keys drop the root's trailing slash ("C:/" → "C:"), and
+    # abspath("C:..") is drive-RELATIVE on Windows — it jumps back down into
+    # the cwd, so a walk over normalized keys never converges (infinite loop).
+    current_path = os.path.abspath(get_cwd())
+    projects = config.get("projects") or {}
     while True:
-        path_config = (config.get("projects") or {}).get(current_path)
-        if path_config and path_config.get("hasTrustDialogAccepted"):
-            return True
-        parent_path = normalize_path_for_config_key(
-            os.path.abspath(os.path.join(current_path, ".."))
-        )
+        # Check the normalized key AND the native form — Claude Code (TS) on
+        # Windows stores backslash keys, and we share ~/.claude.json with it.
+        for key in (normalize_path_for_config_key(current_path), current_path):
+            path_config = projects.get(key)
+            if path_config and path_config.get("hasTrustDialogAccepted"):
+                return True
+        parent_path = os.path.dirname(current_path)
         if parent_path == current_path:
             break
         current_path = parent_path
@@ -258,16 +264,18 @@ def _compute_trust_dialog_accepted() -> bool:
 
 
 def is_path_trusted(directory: str) -> bool:
-    """Check trust for an arbitrary directory (walks ancestors; no session trust)."""
+    """Check trust for an arbitrary directory (walks ancestors; no session trust).
+    Walks the real absolute path, normalizing only for key lookups — see the
+    convergence note in _compute_trust_dialog_accepted."""
     config = get_global_config()
-    current_path = normalize_path_for_config_key(os.path.abspath(directory))
+    current_path = os.path.abspath(directory)
     while True:
-        pc = (config.get("projects") or {}).get(current_path)
+        pc = (config.get("projects") or {}).get(
+            normalize_path_for_config_key(current_path)
+        )
         if pc and pc.get("hasTrustDialogAccepted"):
             return True
-        parent_path = normalize_path_for_config_key(
-            os.path.abspath(os.path.join(current_path, ".."))
-        )
+        parent_path = os.path.dirname(current_path)
         if parent_path == current_path:
             return False
         current_path = parent_path

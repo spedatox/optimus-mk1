@@ -17,7 +17,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from optimus.bootstrap.state import get_session_id, get_todos, set_todos
-from optimus.Tool import PermissionResult, ToolResult, ToolUseContext, ValidationResult, build_tool
+from optimus.tool import PermissionResult, ToolResult, ToolUseContext, ValidationResult, build_tool
 from optimus.tools.todo_write_tool.prompt import DESCRIPTION, PROMPT, TODO_WRITE_TOOL_NAME
 
 _TODO_ITEM = {

@@ -17,7 +17,7 @@ import time
 from typing import Any, Optional
 
 from optimus.api import run_web_search
-from optimus.Tool import PermissionResult, ToolResult, ToolUseContext, ValidationResult, build_tool
+from optimus.tool import PermissionResult, ToolResult, ToolUseContext, ValidationResult, build_tool
 from optimus.tools.web_search_tool.prompt import WEB_SEARCH_TOOL_NAME, get_web_search_prompt
 
 _INPUT_SCHEMA: dict[str, Any] = {

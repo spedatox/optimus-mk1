@@ -39,7 +39,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from optimus import query as Q
 from optimus.api import call_model
-from optimus.Tool import ToolUseContext, ToolUseContextOptions
+from optimus.tool import ToolUseContext, ToolUseContextOptions
 from optimus.tools import get_project_tools
 
 # ---------------------------------------------------------------------------

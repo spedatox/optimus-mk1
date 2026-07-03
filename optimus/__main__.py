@@ -422,6 +422,28 @@ def main() -> None:
 # Entry point — mirrors `void main()` at end of cli.tsx
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    # Windows consoles default to a legacy codepage (cp1252/cp857) that
+    # renders the banner's em-dashes and box characters as '?'. Force UTF-8.
+    if sys.platform == "win32":
+        for _stream in (sys.stdout, sys.stderr):
+            try:
+                _stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+    # Load .env file from the optimus project root (parent of this package dir)
+    # so API keys like ANTHROPIC_API_KEY, GEMINI_API_KEY, etc. are available.
+    try:
+        from pathlib import Path
+        from dotenv import load_dotenv
+        _project_root = Path(__file__).resolve().parent.parent
+        _env_file = _project_root / ".env"
+        if _env_file.is_file():
+            load_dotenv(_env_file, override=False)
+            logging.getLogger(__name__).debug("Loaded .env from %s", _env_file)
+    except ImportError:
+        pass  # python-dotenv not installed — rely on shell environment
+
     # CLAUDE_CODE_REMOTE: no heap-size flag needed in Python (unlike Node)
     # ABLATION_BASELINE: feature-gated, FEATURE_ABLATION_BASELINE = False
     logging.basicConfig(

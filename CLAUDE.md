@@ -161,12 +161,17 @@ before porting the file itself.
 - `src/tools/`              → `optimus/tools/`
 
 ### Tools ported so far
-Glob, Grep, FileRead, FileWrite, FileEdit, PowerShell, TodoWrite, WebFetch,
-WebSearch, NotebookEdit, **AskUserQuestion** ✅ (11/40). Remaining: AgentTool,
-Bash, Brief, Config, EnterPlanMode, EnterWorktree, ExitPlanMode, ExitWorktree,
-LSP, ListMcpResources, MCP, McpAuth, REPL, ReadMcpResource, RemoteTrigger,
-ScheduleCron, SendMessage, Skill, Sleep, SyntheticOutput, TaskCreate/Get/List/
-Output/Stop/Update, TeamCreate, TeamDelete, ToolSearch.
+All 40 tools ✅. Core: Glob, Grep, FileRead, FileWrite, FileEdit, Bash,
+PowerShell, NotebookEdit, TodoWrite, WebFetch, WebSearch, AskUserQuestion,
+EnterPlanMode, ExitPlanMode, Agent, Skill, ToolSearch, Sleep, REPL, Brief,
+Config, SyntheticOutput. Tasks: TaskCreate/Get/List/Update (task list),
+TaskOutput/TaskStop (background registry). Worktrees: EnterWorktree,
+ExitWorktree. MCP: MCPTool (dynamic wrapper), ListMcpResources,
+ReadMcpResource, McpAuth. Scheduling: CronCreate/CronDelete/CronList,
+RemoteTrigger. Swarm: TeamCreate, TeamDelete, SendMessage. LSP: disabled
+until a language server is registered. Deep shell security machinery
+(bashSecurity/heredoc/sandbox) is RE-ENTRY — shell tools fail safe by
+prompting via check_permissions='ask'.
 
 ---
 

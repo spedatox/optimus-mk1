@@ -68,6 +68,76 @@ changed → why.
   (`{'type','message':{'role','content'}}`) the query loop carries — previously
   it read top-level role/content and silently dropped every message.
 
+## optimus/llm_client.py (NEW — not in the TS source)
+- Multi-provider routing ported from **SPEDA Mark VI**
+  (`packages/api/app/services/llm_client.py`), not from Claude Code. Claude Code
+  is Anthropic-only (plus Bedrock/Vertex/Foundry, which are still Anthropic
+  models); this is a deliberate feature addition requested for optimus.
+- Model refs are `"provider:model"` — `openai:`, `gemini:`, `zai:`, `deepseek:`,
+  `ollama:` — bare names stay Anthropic, so all existing refs keep working.
+  All five non-Anthropic providers share one OpenAI chat-completions adapter
+  (Gemini/z.ai/DeepSeek/Ollama expose OpenAI-compatible endpoints).
+- Internal format stays Anthropic content blocks everywhere; translation
+  happens at the wire boundary only. Responses come back as attribute-
+  compatible dataclasses (`LLMMessage`/`TextBlock`/`ToolUseBlock`/`Usage`), so
+  `call_model()`'s block-conversion loop is provider-agnostic.
+- speda's `settings` object → environment variables (`OPENAI_API_KEY`,
+  `GEMINI_API_KEY`, `ZAI_API_KEY`, `DEEPSEEK_API_KEY`, `OLLAMA_BASE_URL`,
+  `LLM_FALLBACK_CHAIN`); speda's `LLMClient` class + `_StreamHandle` →
+  module-level functions (`fallback_chain`, `create_via_compat`,
+  `open_compat_stream`) because optimus/api.py owns the Anthropic path and
+  the fallback loop directly.
+- **api.py integration:** `call_model()` and `query_fast_model()` iterate the
+  fallback chain; extended-thinking kwargs apply to the Anthropic branch only
+  (GLM/DeepSeek thinking is toggled per-provider in `to_openai_params`).
+  `run_web_search()` remains Anthropic-only (server-side tool).
+- New dependency: `openai>=1.50` (imported lazily — only loaded when a
+  non-Anthropic provider is actually used).
+
+## Tool restoration (28 tools) — 2026-07-03
+The a719409 restructure dropped 28 of the 40 tools ported at f696afe (plus
+their support modules). The TS source tree is no longer on disk, so the
+f696afe implementations served as the spec; every tool was rewritten to the
+current `@build_tool` protocol (prompt.py split, ToolResult returns,
+check_permissions → PermissionResult, map_tool_result_to_tool_result_block_param).
+- **Support modules restored:** `tasks/task_registry.py` (background handles),
+  `utils/tasks.py` (task list store, + metadata merge & dependency links),
+  `services/mcp.py` (MCP manager), `utils/swarm/` (mailbox, team helpers).
+- **`commands/__init__.py` rewritten** (legacy module was removed): markdown
+  slash-command loader over `.claude/commands/**/*.md` + `~/.claude/commands/`,
+  frontmatter via utils/frontmatter_parser, `$ARGUMENTS`/`$ARGS` expansion.
+  Backs SkillTool.
+- **BashTool:** the 7588b87 bash security infrastructure (heredoc rewriting,
+  command parsing, sandbox) was also dropped in the restructure and remains
+  RE-ENTRY. Bash mirrors PowerShellTool's subprocess machinery; fail-safe
+  `check_permissions='ask'`. Shell resolution prefers $SHELL/PATH bash, then
+  Git-for-Windows install paths.
+- **AgentTool:** wired to the real query loop (QueryParams + production_deps +
+  api.call_model). Explore/Plan agents get a read-only tool pool; nesting is
+  blocked; parent abort_controller and permission context are inherited.
+  Parallel/background agents → RE-ENTRY.
+- **ExitPlanModeTool:** plan approval rides the permission gate
+  (`check_permissions='ask'`) instead of the TS PlanApprovalDialog; restores
+  `pre_plan_mode` recorded by EnterPlanModeTool.
+- **REPLTool:** upgraded from eval-or-exec to AST splitting so the trailing
+  expression of a multi-statement snippet is echoed (true REPL semantics).
+- **LSPTool:** enabled only when a language server client is registered via
+  `register_lsp_client()` (mirrors per-server LSP tools in the source); the
+  connection stack is RE-ENTRY.
+- **SyntheticOutputTool:** schema registered via `set_output_schema()`;
+  validation degrades from jsonschema to required-property checks when the
+  package is missing. `is_enabled()` False until a schema is registered.
+- **CronCreate/Delete/List:** in-memory registry (50-job cap) with durable
+  jobs persisted to `~/.optimus/cron_jobs.json`; the firing loop is RE-ENTRY.
+- **RemoteTrigger:** aiohttp → httpx (already a dependency); oauth bearer from
+  optimus.api; base URL via `CLAUDE_AI_API_URL` env.
+- **optimus/__init__.py:** registers `optimus.Tool` as an alias of
+  `optimus.tool` in sys.modules — the whole codebase imports `optimus.Tool`
+  (mirroring src/Tool.ts) but Python imports are case-sensitive even on
+  Windows; without the alias nothing imported.
+- **pyproject:** added `pathspec`, `beautifulsoup4` (used by utils/glob.py and
+  WebFetchTool but previously undeclared) and `jsonschema`.
+
 ## utils/claudeMd.ts → optimus/claudemd.py
 - **marked Lexer (gfm:false)** → a focused markdown scanner: `strip_html_comments`
   + `_remove_code_regions`/`_extract_include_paths` track fenced code blocks and
@@ -233,3 +303,23 @@ delete + all validate_input branches + block-param rendering end-to-end.
   (`_update_context`) so the value stays a `ToolUseContext` — matching the TS
   object-spread `{ ...update.newContext, queryTracking }`. Verified by a full
   model→tool→model→Terminal loop test.
+
+## 2026-07-03 audit fixes
+- **tui/screens/repl.py** — `_run_query` / `_handle_slash_command` were launched
+  with `asyncio.create_task`; `push_screen_wait` (PermissionModal,
+  AskUserQuestionModal) requires an active Textual worker, so every
+  non-pre-approved tool call raised `NoActiveWorker` and killed the turn.
+  Now launched via `self.run_worker(..., exclusive=False)`. Verified headlessly:
+  input → tool_use(Bash) → modal → approve → tool runs → final answer renders.
+- **`optimus.Tool` → `optimus.tool`** (46 files) — the module file is `tool.py`;
+  the capitalized import only worked on Windows' case-insensitive filesystem and
+  would break the entire package on Linux/macOS.
+- **`optimus/__main__.py`** — force UTF-8 on stdout/stderr on Windows; legacy
+  console codepages rendered em-dashes/box chars in the banner and doctor
+  output as `?`.
+- **Known gaps (not fixed):** `optimus/peer/client.py` is missing —
+  `optimus.peer` (`python -m optimus.peer`) cannot import; `handlers.py` and
+  `config.py` exist, the WebSocket client itself was never written.
+  `optimus.server` requires the `fastapi` extra (not installed).
+  `optimus/print.py` not ported — `-p/--print` uses the minimal fallback in
+  main.py (works).

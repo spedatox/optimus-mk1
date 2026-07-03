@@ -171,7 +171,9 @@ class ReplScreen(Screen):
 
         # If --prompt was passed, fire it immediately
         if self._prompt:
-            asyncio.create_task(self._run_query(self._prompt))
+            # Worker (not a bare task): push_screen_wait in the permission
+            # flow requires an active Textual worker context.
+            self.run_worker(self._run_query(self._prompt), exclusive=False)
 
     async def _detect_git_branch(self) -> None:
         try:
@@ -219,9 +221,11 @@ class ReplScreen(Screen):
             return
         event.stop()
         if text.startswith("/"):
-            asyncio.create_task(self._handle_slash_command(text))
+            self.run_worker(self._handle_slash_command(text), exclusive=False)
         else:
-            asyncio.create_task(self._run_query(text))
+            # Worker (not a bare task): push_screen_wait in the permission
+            # flow requires an active Textual worker context.
+            self.run_worker(self._run_query(text), exclusive=False)
 
     @on(CancelRequested)
     def on_cancel_requested(self, event: CancelRequested) -> None:
@@ -256,10 +260,10 @@ class ReplScreen(Screen):
         self._set_waiting(False)
 
     def action_clear_screen(self) -> None:
-        asyncio.create_task(self._handle_slash_command("/clear"))
+        self.run_worker(self._handle_slash_command("/clear"), exclusive=False)
 
     def action_show_help(self) -> None:
-        asyncio.create_task(self._handle_slash_command("/help"))
+        self.run_worker(self._handle_slash_command("/help"), exclusive=False)
 
     def action_focus_input(self) -> None:
         self.query_one("#input-bar", InputBar).focus_input()
@@ -306,15 +310,11 @@ class ReplScreen(Screen):
                 self._post_system("Usage: /resume <session-id>")
 
         # ── Model / output ────────────────────────────────────────────────
-        elif cmd in ("/model", "/m"):
+        elif cmd in ("/model", "/m", "/models"):
             if arg:
                 self._switch_model(arg)
             else:
-                self._post_system(
-                    f"Current model: [bold]{self._model}[/bold]\n"
-                    "Usage: /model <name>\n"
-                    "Examples: /model claude-haiku-4-5  /model claude-sonnet-4-6  /model claude-opus-4"
-                )
+                await self._cmd_list_models()
 
         elif cmd == "/effort":
             self._cmd_effort(arg)
@@ -885,6 +885,34 @@ class ReplScreen(Screen):
         lines.append(f"  Session  : {self._session_id}")
         self._post_system("\n".join(lines))
 
+    async def _cmd_list_models(self) -> None:
+        """/model with no argument — interactive picker over the live listing
+        from every configured provider's models endpoint (catalog fallback
+        per provider)."""
+        self._post_system("Fetching models from configured providers…")
+        try:
+            from optimus.llm_client import available_models
+            models = await available_models()
+        except Exception as exc:
+            self._post_system(f"Model listing failed: {exc}")
+            return
+        if not models:
+            self._post_system(
+                "No providers configured.\n"
+                "Set ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, "
+                "ZAI_API_KEY or DEEPSEEK_API_KEY — or start a local Ollama."
+            )
+            return
+
+        from optimus.tui.components.model_picker import ModelPickerModal
+        # Runs inside a worker (slash commands are run_worker-launched), so
+        # push_screen_wait is legal here.
+        chosen = await self.app.push_screen_wait(
+            ModelPickerModal(models, self._model)
+        )
+        if chosen and chosen != self._model:
+            self._switch_model(chosen)
+
     def _switch_model(self, model_name: str) -> None:
         self._model = model_name
         sb = self.query_one("#status-bar", StatusBar)
@@ -985,7 +1013,7 @@ class ReplScreen(Screen):
             from optimus.query import (
                 query, QueryParams, production_deps, Terminal,
             )
-            from optimus.Tool import ToolUseContext, ToolUseContextOptions
+            from optimus.tool import ToolUseContext, ToolUseContextOptions
             from optimus.api import call_model
         except ImportError as exc:
             assistant_widget.finish_streaming(f"[red]Import error: {exc}[/red]")

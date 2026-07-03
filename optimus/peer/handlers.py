@@ -26,7 +26,7 @@ from typing import Any, AsyncGenerator
 
 from optimus import query as Q
 from optimus.api import call_model
-from optimus.Tool import ToolUseContext, ToolUseContextOptions
+from optimus.tool import ToolUseContext, ToolUseContextOptions
 from optimus.peer.config import PeerConfig
 from optimus.tools import get_project_tools
 

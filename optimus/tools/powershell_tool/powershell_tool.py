@@ -21,7 +21,7 @@ import os
 import shutil
 from typing import Any, Optional
 
-from optimus.Tool import (
+from optimus.tool import (
     PermissionResult,
     ToolResult,
     ToolUseContext,

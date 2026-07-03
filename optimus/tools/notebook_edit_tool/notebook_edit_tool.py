@@ -23,7 +23,7 @@ import random
 import string
 from typing import Any, Optional
 
-from optimus.Tool import (
+from optimus.tool import (
     PermissionResult,
     ToolResult,
     ToolUseContext,

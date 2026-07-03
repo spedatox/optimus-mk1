@@ -24,7 +24,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from optimus.api import query_fast_model
-from optimus.Tool import PermissionResult, ToolResult, ToolUseContext, ValidationResult, build_tool
+from optimus.tool import PermissionResult, ToolResult, ToolUseContext, ValidationResult, build_tool
 from optimus.tools.web_fetch_tool.prompt import (
     DESCRIPTION,
     WEB_FETCH_TOOL_NAME,

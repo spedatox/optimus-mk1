@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 from typing import Any, Optional
 
-from optimus.Tool import (
+from optimus.tool import (
     PermissionResult,
     ToolResult,
     ToolUseContext,

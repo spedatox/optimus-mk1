@@ -87,8 +87,8 @@ try:
         normalize_model_string_for_api,
     )
 except ImportError:
-    def get_default_main_loop_model() -> str: return "claude-sonnet-4-6"  # type: ignore[misc]
-    def parse_user_specified_model(m: Any) -> str: return m or "claude-sonnet-4-6"  # type: ignore[misc]
+    def get_default_main_loop_model() -> str: return "claude-sonnet-5"  # type: ignore[misc]
+    def parse_user_specified_model(m: Any) -> str: return m or "claude-sonnet-5"  # type: ignore[misc]
     def normalize_model_string_for_api(m: str) -> str: return m  # type: ignore[misc]
 
 try:
@@ -439,7 +439,7 @@ async def run_headless(
     except ImportError:
         # optimus.print not yet ported — minimal fallback that drives query() directly
         from optimus.query import query, QueryParams, production_deps  # type: ignore[import]
-        from optimus.Tool import ToolUseContext, ToolUseContextOptions  # type: ignore[import]
+        from optimus.tool import ToolUseContext, ToolUseContextOptions  # type: ignore[import]
         from optimus.api import call_model  # type: ignore[import]
         ctx = ToolUseContext(
             options=ToolUseContextOptions(
@@ -609,7 +609,7 @@ async def _one_shot_query(
     """Drive a single query turn through query() and print the result."""
     try:
         from optimus.query import query, QueryParams, production_deps  # type: ignore[import]
-        from optimus.Tool import ToolUseContext, ToolUseContextOptions  # type: ignore[import]
+        from optimus.tool import ToolUseContext, ToolUseContextOptions  # type: ignore[import]
     except ImportError:
         print(f"{CYAN}[optimus.query not yet ported]{RESET}")
         return None
@@ -1024,6 +1024,16 @@ def _show_minimal_trust_dialog() -> None:
     if response not in ("y", "yes"):
         print(f"{DIM}  Aborted.{RESET}")
         graceful_shutdown_sync(0)
+        return
+    # Persist acceptance so the dialog is shown once per project, not per run.
+    try:
+        from optimus.utils.config import save_current_project_config
+
+        save_current_project_config(
+            lambda pc: {**pc, "hasTrustDialogAccepted": True}
+        )
+    except Exception as exc:
+        log_for_debugging(f"[trust] could not persist acceptance: {exc}")
 
 
 async def _get_input_prompt(prompt: Optional[str], input_format: str) -> str:
@@ -1046,12 +1056,6 @@ async def _get_input_prompt(prompt: Optional[str], input_format: str) -> str:
                 sys.stderr.write(
                     "Warning: no stdin data received in 3s, proceeding without it.\n"
                 )
-        else:
-            # Windows: just read synchronously
-            try:
-                data = sys.stdin.read()
-            except Exception:
-                pass
         return "\n".join(filter(None, [prompt, data]))
     return prompt or ""
 

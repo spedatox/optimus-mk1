@@ -4,6 +4,15 @@ optimus/api.py — port of src/utils/api.ts
 The real call_model() function that wraps the Anthropic SDK.
 query_loop() calls this via QueryDeps.call_model.
 
+Multi-provider support (ported from SPEDA Mark VI): the model option is a
+"provider:model" ref — "openai:gpt-5.1", "gemini:gemini-2.5-flash",
+"zai:glm-5.2", "deepseek:deepseek-v4-pro", "ollama:llama3.1:8b". A bare model
+name routes to Anthropic exactly as before. Non-Anthropic refs are served by
+optimus.llm_client through each provider's OpenAI-compatible endpoint and
+translated back into the same yield format, so query_loop() never notices.
+LLM_FALLBACK_CHAIN (comma-separated refs) is tried in order when a provider
+fails while opening the stream.
+
 Expected yield format (one message per API call, matching the TS callModel shape):
     {
         'type': 'assistant',
@@ -24,6 +33,8 @@ import os
 from typing import Any, AsyncGenerator, Optional
 
 import anthropic
+
+from optimus import llm_client
 
 
 # ---------------------------------------------------------------------------
@@ -78,16 +89,31 @@ async def query_fast_model(
     max_tokens: int = 2048,
 ) -> str:
     """Run a single non-streaming completion and return the text."""
-    client = _get_client()
     kwargs: dict[str, Any] = {
-        "model": model,
         "max_tokens": max_tokens,
         "messages": [{"role": "user", "content": prompt}],
     }
     if system:
         kwargs["system"] = system
-    msg = await client.messages.create(**kwargs)
-    return "".join(b.text for b in msg.content if getattr(b, "type", None) == "text")
+
+    last_exc: Optional[Exception] = None
+    for provider, provider_model in llm_client.fallback_chain(model):
+        try:
+            if provider == "anthropic":
+                client = _get_client()
+                msg = await client.messages.create(**kwargs, model=provider_model)
+            else:
+                # Short one-shot task: cap hidden reasoning so the visible
+                # output isn't starved (see llm_client.to_openai_params).
+                msg = await llm_client.create_via_compat(
+                    provider, provider_model, {**kwargs, "reasoning_effort": "low"}
+                )
+            return "".join(
+                b.text for b in msg.content if getattr(b, "type", None) == "text"
+            )
+        except Exception as exc:
+            last_exc = exc
+    raise last_exc  # chain exhausted
 
 
 async def run_web_search(
@@ -122,6 +148,21 @@ async def run_web_search(
 # Helpers
 # ---------------------------------------------------------------------------
 
+class CredentialsError(Exception):
+    """No usable Anthropic credentials — carries actionable guidance."""
+
+
+_NO_CREDENTIALS_MESSAGE = """\
+No Anthropic credentials found. Fix one of:
+  1. Set ANTHROPIC_API_KEY in your environment (or in a .env next to the optimus package)
+  2. Set ANTHROPIC_AUTH_TOKEN (OAuth bearer token)
+  3. Add "primaryApiKey" to ~/.claude.json
+  4. Use another provider via --model provider:model —
+     openai:gpt-5-mini (OPENAI_API_KEY), gemini:gemini-2.5-flash (GEMINI_API_KEY),
+     zai:glm-4.5-air (ZAI_API_KEY), deepseek:deepseek-v4-flash (DEEPSEEK_API_KEY),
+     or ollama:<model> (local, free — no key needed)"""
+
+
 def _get_client() -> anthropic.AsyncAnthropic:
     """Return a configured AsyncAnthropic client (oauth bearer or API key)."""
     base_url = os.environ.get("ANTHROPIC_BASE_URL")
@@ -137,6 +178,10 @@ def _get_client() -> anthropic.AsyncAnthropic:
         api_key = _get_anthropic_api_key()
         if api_key:
             kwargs["api_key"] = api_key
+        else:
+            # Fail here with guidance instead of letting the SDK raise its
+            # cryptic "Could not resolve authentication method" later.
+            raise CredentialsError(_NO_CREDENTIALS_MESSAGE)
     return anthropic.AsyncAnthropic(**kwargs)
 
 
@@ -228,10 +273,8 @@ async def call_model(
         abort_event     — asyncio.Event (set → cancel)
         options         — dict with 'model', 'max_output_tokens_override', etc.
     """
-    model: str = options.get("model", "claude-sonnet-4-6")
+    model: str = options.get("model", "claude-sonnet-5")
     max_tokens: int = options.get("max_output_tokens_override") or 8096
-
-    client = _get_client()
 
     # Build system string
     system_str = "\n\n".join(s for s in system_prompt if isinstance(s, str) and s.strip())
@@ -245,9 +288,9 @@ async def call_model(
     # Convert tools
     api_tools = await _convert_tools(tools)
 
-    # Build kwargs
+    # Build kwargs in Anthropic Messages format — the internal lingua franca.
+    # llm_client translates these at the wire boundary for other providers.
     kwargs: dict[str, Any] = {
-        "model": model,
         "max_tokens": max_tokens,
         "messages": api_messages,
     }
@@ -256,13 +299,40 @@ async def call_model(
     if api_tools:
         kwargs["tools"] = api_tools
 
-    # Extended thinking
     thinking_type = thinking_config.get("type", "disabled") if thinking_config else "disabled"
-    if thinking_type in ("enabled", "adaptive"):
-        kwargs["thinking"] = {"type": "enabled", "budget_tokens": min(max_tokens // 2, 10000)}
 
-    # Stream the response
-    async with client.messages.stream(**kwargs) as stream:
+    # Open a stream, trying each (provider, model) in the fallback chain.
+    # Fallback applies only while opening — once tokens are flowing the
+    # response cannot be restarted on another provider.
+    anthropic_cm: Any = None
+    compat_stream: Any = None
+    stream: Any = None
+    last_exc: Optional[Exception] = None
+    for provider, provider_model in llm_client.fallback_chain(model):
+        try:
+            if provider == "anthropic":
+                anthro = dict(kwargs, model=provider_model)
+                # Extended thinking is Anthropic-only; other providers manage
+                # reasoning via their own toggles (see llm_client).
+                if thinking_type in ("enabled", "adaptive"):
+                    anthro["thinking"] = {
+                        "type": "enabled",
+                        "budget_tokens": min(max_tokens // 2, 10000),
+                    }
+                anthropic_cm = _get_client().messages.stream(**anthro)
+                stream = await anthropic_cm.__aenter__()
+            else:
+                compat_stream = llm_client.open_compat_stream(provider, provider_model, kwargs)
+                await compat_stream.open()
+                stream = compat_stream
+            break
+        except Exception as exc:
+            anthropic_cm = compat_stream = None
+            last_exc = exc
+    if stream is None:
+        raise last_exc  # chain exhausted
+
+    try:
         # Yield partial text events as stream events so the REPL can
         # display text as it arrives (mirrors TS callModel streaming)
         async for text in stream.text_stream:
@@ -276,6 +346,11 @@ async def call_model(
 
         # Yield the final complete assistant message
         final = await stream.get_final_message()
+    finally:
+        if anthropic_cm is not None:
+            await anthropic_cm.__aexit__(None, None, None)
+        elif compat_stream is not None:
+            await compat_stream.aclose()
 
     # Convert SDK ContentBlock objects to plain dicts
     content_blocks = []

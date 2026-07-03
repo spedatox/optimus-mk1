@@ -29,7 +29,7 @@ import uuid as _uuid_mod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable, Optional
 
-from optimus.Tool import (
+from optimus.tool import (
     ToolUseContext,
     QueryChainTracking,
     find_tool_by_name,
