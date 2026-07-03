@@ -323,3 +323,133 @@ delete + all validate_input branches + block-param rendering end-to-end.
   `optimus.server` requires the `fastapi` extra (not installed).
   `optimus/print.py` not ported — `-p/--print` uses the minimal fallback in
   main.py (works).
+
+## 2026-07-03 — TUI 1:1 porting pass (session 2)
+
+### tui/components/permission.py — rewritten against source
+- Replaced the invented "Allow Once / Allow Session / Allow Permanently /
+  Deny" button dialog with the real 2–3 row Select: **Yes / Yes, and don't
+  ask again for `<rule>` / No** (PermissionDialog.tsx + bashToolUseOptions.tsx
+  + shellPermissionHelpers.tsx). The remember row only appears when a rule
+  can be generated (Bash prefix, file directory, web domain) — Agent/MCP
+  tools get Yes/No only, matching `suggestions.length > 0` gating.
+- Rule matching is prefix/dir/domain-scoped (subcommand-scoped for git/npm/
+  cargo/… like the real `npm run:*` rules). Rules survive /clear.
+- Escape resolves to No (`onCancel={() => handleReject()}`).
+- NOT ported (RE-ENTRY): settings.json rule persistence, Haiku classifier
+  descriptions, editable-prefix input mode, PermissionRuleExplanation banner.
+
+### tui/components/spinner.py — new (Spinner.tsx port)
+- SpinnerWithVerb line: `✻ Pondering… (esc to interrupt · 32s · ↓ 1.2k tokens
+  · thinking)`. Glyphs ·✢*✶✻✽ forward+reversed @120ms (getDefaultCharacters);
+  204 SPINNER_VERBS verbatim; glimmer sweep (width+20 cycle, 200ms step,
+  right-to-left); stall→error-red fade after 3s idle (useStalledAnimation,
+  0.1 smoothing per 50ms tick); smooth token counter (3/15%/50 increments);
+  timer+tokens gated behind 30s (SHOW_TOKENS_AFTER_MS) or verbose; thinking
+  status with 2s-minimum display windows.
+- NOT ported: teammate spinner tree, brief-mode spinner, TaskListV2 panel
+  (multi-agent SaaS), per-char shimmer (approximated as 3-char highlight).
+
+### tui/components/messages.py
+- Spinner frames corrected: braille (never used by Claude Code) → asterisk set.
+- `render_special_assistant_text`: AssistantTextMessage.tsx switch(text) —
+  NO_RESPONSE_REQUESTED renders nothing; user-abort → InterruptedByUser line;
+  prompt-too-long, credit-low, invalid-key, timeout, API-error-prefix (1000
+  char truncation) render as error lines, not Markdown. Sentinel strings
+  mirror services/api/errors.ts for when the api layer is ported.
+- New renderers: bash-input (`! cmd` on bashMessageBackground), bash-output
+  (stdout dim / stderr error, 10-line truncation), compact-boundary
+  (`✻ Conversation compacted`), interrupted. extract_tag ports
+  utils/messages.ts extractTag.
+- Removed invented "Thinking…" in-message placeholder — empty streaming
+  assistant messages render nothing (isEmptyMessageText → null); loading
+  state lives in the SpinnerLine mounted below the list.
+
+### tui/components/diff.py — new (StructuredDiff/Fallback.tsx port)
+- transformLinesToObjects / processAdjacentLines (k-th remove ↔ k-th add
+  pairing) / numberDiffLines / word-level diff with CHANGE_THRESHOLD=0.4
+  fallback to whole-line. difflib.SequenceMatcher over words+whitespace
+  tokens replaces jsdiff diffWordsWithSpace. darkTheme diff colours exact.
+- Wired into Edit (old/new diff) and Write (diff vs existing file) permission
+  previews. NOT ported: Rust colorDiff syntax highlighting (fallback IS the
+  spec here), per-part wrap (Textual wraps).
+
+### tui/components/input_bar.py — footer row (PromptInputFooterLeftSide)
+- `? for shortcuts` idle hint; `! for bash mode` when input starts with `!`;
+  mode indicator `⏵⏵ accept edits on (shift+tab to cycle)` / `⏸ plan mode on`
+  with PermissionMode.ts config (titles/symbols/colours); `Press ctrl+c
+  again to exit` ExitFlow with 2s window.
+- shift+tab cycles default → acceptEdits → plan; bash mode `!cmd` posts
+  BashInputSubmitted (runs in shell, echoes as bash-input/output messages,
+  recorded in history for the model).
+- repl.py: acceptEdits auto-approves edit tools; plan refuses them.
+
+### optimus/__init__.py — startup fix
+- `from optimus import tool` → `from optimus import Tool`: the file on disk
+  is Tool.py; the lowercase import made `import optimus` fail everywhere.
+
+## 2026-07-03 — TUI 1:1 porting pass (session 3)
+
+### tui/themes.py — new (utils/theme.ts port)
+- Theme dataclass with all 69 palette keys, snake_cased 1:1. All six themes:
+  dark, light, light-daltonized, dark-daltonized, light-ansi, dark-ansi.
+  RGB values converted to hex; ansi themes use Rich 16-colour names
+  (chalk `ansi:redBright` → `bright_red`). get_theme() falls back to dark.
+- set_active_theme/active_theme replace the useTheme React context.
+- /theme command lists + switches. RE-ENTRY: widgets still load darkTheme
+  hex values at import time — live restyle needs a widget-layer refresh pass.
+- Omitted: themeColorToAnsi (chalk escape generation — Rich downgrades
+  colours itself), Apple_Terminal 256-colour special case.
+
+### tui/components/input_bar.py — ctrl+r reverse history search
+- Port of PromptInput.tsx isSearchingHistory/historyQuery/historyFailedMatch
+  + HistorySearchInput.tsx: footer shows `search prompts: <query>` /
+  `no matching prompt: <query>`; the input displays the newest matching
+  history entry (case-insensitive substring); ctrl+r again cycles older
+  (clamps at oldest); Enter accepts the match; Escape restores what was
+  typed before searching; typing edits the query.
+- Textual-specific: focus moves to InputBar during search because Input
+  consumes printable keys before they bubble (source equivalent:
+  focus={!isSearchingHistory}). Input.Changed is suppressed while searching
+  (suppressSuggestions).
+- RE-ENTRY: cross-session persistent history (utils/history storage not
+  ported; search covers the in-session history list).
+
+### tui/components/input_bar.py — @-file mentions
+- complete_file_paths ports the unified-suggestions file source: completes
+  relative to cwd, directories suffixed '/', hidden entries only when the
+  typed segment starts with '.', 13-item cap.
+- Trailing '@token' opens the overlay in mention mode (SlashOverlay grew a
+  generic items mode reusing the slash rendering); Tab/Enter replaces the
+  token; directory completions keep the overlay open one level deeper.
+- RE-ENTRY: mentions stay literal '@path' text in the prompt; converting to
+  file-content attachments needs utils/attachments.ts.
+
+### ctrl+o expand (CtrlOToExpand)
+- Screen binding toggles full tool output on every ToolPanel; truncation
+  notice now says "ctrl+o to expand". The screen-level ctrl+r binding was
+  removed (ctrl+r is history search, as in source).
+- RE-ENTRY: full transcript mode (ctrl+o in fullscreen flips to a separate
+  transcript view) — this port only expands tool results.
+
+## 2026-07-03 — visual-fidelity fixes from live screenshots (session 4)
+
+### ToolPanel de-blocked (messages.py)
+- Removed the invented background `#413c41` + thick purple border-left —
+  Claude Code renders tool calls flat on the terminal background.
+- Header is now `● Name(primary-arg)`: dot green/red/spinner, name bold
+  default-colour, primary arg only (renderToolUseMessage style — e.g.
+  `Write(index.html)`, not `file_path='C:\…'`). Paths relativised to cwd.
+- Result row `⎿ …` in inactive grey (was green); errors stay red.
+
+### Spinner pinned above the input bar (repl.py)
+- SpinnerLine no longer mounts inside the scrollable message container; a
+  fixed `#spinner-slot` sits between MessageList and InputBar, matching
+  REPL.tsx (<Spinner> renders above <PromptInput>, outside the transcript).
+  Screen owns _show_spinner/_hide_spinner; MessageList versions removed.
+
+### Edit/Write tool results (messages.py)
+- Edit family: `⎿ Updated <file> with N additions and M removals` +
+  word-level StructuredDiff (12-row cap, ctrl+o expands) —
+  FileEditToolResultMessage.
+- Write: `⎿ Wrote N lines to <file>` — FileWriteToolResultMessage.

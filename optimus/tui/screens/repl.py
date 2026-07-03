@@ -20,6 +20,7 @@ from typing import Optional, Any
 
 from textual import on
 from textual.app import ComposeResult
+from textual.containers import Vertical
 from textual.screen import Screen
 
 from optimus.tui.components.messages import (
@@ -27,12 +28,13 @@ from optimus.tui.components.messages import (
 )
 from optimus.tui.components.input_bar import (
     InputBar, InputSubmitted, CancelRequested, SlashInputChanged,
-    SlashOverlay,
+    SlashOverlay, BashInputSubmitted, PermissionModeChanged, ExitRequested,
+    MentionInputChanged, complete_file_paths,
 )
 from optimus.tui.components.status_bar import StatusBar
 from optimus.tui.brand import ACCENT, NAME
 from optimus.tui.components.permission import (
-    PermissionRequest, PermissionModal, DangerousPermissionModal,
+    PermissionRequest, PermissionModal,
     PermissionManager, PermissionLevel,
     build_permission_request, AskUserQuestionModal,
 )
@@ -64,7 +66,8 @@ class ReplScreen(Screen):
         ("ctrl+c",   "request_cancel",   "Cancel"),
         ("ctrl+l",   "clear_screen",     "Clear"),
         ("f1",       "show_help",        "Help"),
-        ("ctrl+r",   "focus_input",      "Focus Input"),
+        # ctrl+r belongs to InputBar (reverse history search, as in source)
+        ("ctrl+o",   "toggle_expand",    "Expand output"),
     ]
 
     def __init__(
@@ -107,7 +110,9 @@ class ReplScreen(Screen):
         self._perm_manager                = PermissionManager()
         self._cancel_event: asyncio.Event = asyncio.Event()
         self._query_task: Optional[asyncio.Task] = None
-        self._session_grants: set[str]    = set()
+
+        # Permission mode (shift+tab cycled): default | acceptEdits | plan
+        self._permission_mode: str        = "default"
 
         # User-configurable session preferences
         self._effort_level: str           = "medium"
@@ -123,10 +128,23 @@ class ReplScreen(Screen):
     # Compose
     # ------------------------------------------------------------------
 
+    DEFAULT_CSS = """
+    ReplScreen #spinner-slot {
+        height: auto;
+        background: #1a1a1a;
+        padding: 0 1;
+    }
+    """
+
     def compose(self) -> ComposeResult:
         # Claude Code has no top header bar
         yield MessageList(model=self._model, cwd=os.getcwd(), id="message-list")
         yield SlashOverlay(id="slash-overlay")   # floats above InputBar via layer/dock
+        # SpinnerWithVerb mounts here while a turn is streaming — pinned
+        # between the transcript and the prompt, exactly like the source
+        # (REPL.tsx renders <Spinner> above <PromptInput>, outside the
+        # scrollable message area).
+        yield Vertical(id="spinner-slot")
         yield InputBar(id="input-bar")
         yield StatusBar(id="status-bar")
 
@@ -230,11 +248,58 @@ class ReplScreen(Screen):
     @on(CancelRequested)
     def on_cancel_requested(self, event: CancelRequested) -> None:
         event.stop()
+        was_running = self._query_task is not None and not self._query_task.done()
         self._cancel_event.set()
-        if self._query_task and not self._query_task.done():
+        if was_running:
+            # _run_query's CancelledError handler renders the
+            # InterruptedByUser line; nothing else to post here.
             self._query_task.cancel()
         self._set_waiting(False)
-        self._post_system("Cancelled.")
+
+    @on(BashInputSubmitted)
+    def on_bash_input_submitted(self, event: BashInputSubmitted) -> None:
+        """Bash mode: run '!command' directly in the shell, echo input and
+        output as UserBashInput/UserBashOutput messages."""
+        event.stop()
+        self.run_worker(self._run_bash_mode(event.command), exclusive=False)
+
+    async def _run_bash_mode(self, command: str) -> None:
+        ml = self.query_one("#message-list", MessageList)
+        ml.add_bash_input(command)
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            out = stdout.decode(errors="replace")
+            err = stderr.decode(errors="replace")
+            ml.add_bash_output(
+                f"<bash-stdout>{out}</bash-stdout><bash-stderr>{err}</bash-stderr>"
+            )
+            # Bash-mode I/O also enters history so the model sees it
+            self._history.append({
+                "role": "user",
+                "content": (
+                    f"<bash-input>{command}</bash-input>\n"
+                    f"<bash-stdout>{out}</bash-stdout><bash-stderr>{err}</bash-stderr>"
+                ),
+            })
+        except Exception as exc:
+            ml.add_bash_output(f"<bash-stderr>{exc}</bash-stderr>")
+
+    @on(PermissionModeChanged)
+    def on_permission_mode_changed(self, event: PermissionModeChanged) -> None:
+        event.stop()
+        self._permission_mode = event.mode
+        sb = self.query_one("#status-bar", StatusBar)
+        sb.permission_mode = event.mode
+
+    @on(ExitRequested)
+    def on_exit_requested(self, event: ExitRequested) -> None:
+        event.stop()
+        self.app.exit()
 
     @on(SlashInputChanged)
     def on_slash_input_changed(self, event: SlashInputChanged) -> None:
@@ -244,8 +309,23 @@ class ReplScreen(Screen):
             ov = self.query_one("#slash-overlay", SlashOverlay)
             if event.value:
                 ov.update(event.value)
-            else:
+            elif ov.get_kind() == "slash":
                 ov.hide()
+        except Exception:
+            pass
+
+    @on(MentionInputChanged)
+    def on_mention_input_changed(self, event: MentionInputChanged) -> None:
+        """Relay @-mention prefixes to the overlay as file completions."""
+        event.stop()
+        try:
+            ov = self.query_one("#slash-overlay", SlashOverlay)
+            if event.prefix is None:
+                if ov.get_kind() == "mention":
+                    ov.hide()
+                return
+            completions = complete_file_paths(event.prefix)
+            ov.update_mentions(event.prefix, completions)
         except Exception:
             pass
 
@@ -268,6 +348,32 @@ class ReplScreen(Screen):
     def action_focus_input(self) -> None:
         self.query_one("#input-bar", InputBar).focus_input()
 
+    def action_toggle_expand(self) -> None:
+        """ctrl+o — expand/collapse full tool output (CtrlOToExpand)."""
+        ml = self.query_one("#message-list", MessageList)
+        ml.toggle_verbose()
+
+    # ------------------------------------------------------------------
+    # Turn spinner — mounted in #spinner-slot (pinned above the input bar)
+    # ------------------------------------------------------------------
+
+    def _show_spinner(self):
+        from optimus.tui.components.spinner import SpinnerLine  # noqa: PLC0415
+        self._hide_spinner()
+        sp = SpinnerLine(id="turn-spinner")
+        self.query_one("#spinner-slot", Vertical).mount(sp)
+        self._spinner = sp
+        return sp
+
+    def _hide_spinner(self) -> None:
+        sp = getattr(self, "_spinner", None)
+        if sp is not None:
+            try:
+                sp.remove()
+            except Exception:
+                pass
+            self._spinner = None
+
     # ------------------------------------------------------------------
     # Slash command handler
     # ------------------------------------------------------------------
@@ -285,7 +391,8 @@ class ReplScreen(Screen):
             ml = self.query_one("#message-list", MessageList)
             ml.clear_messages()
             self._history.clear()
-            self._perm_manager.clear_session_grants()
+            # Permission rules are NOT cleared by /clear — matches real
+            # Claude Code, where "don't ask again" writes a persisted rule.
             sb = self.query_one("#status-bar", StatusBar)
             sb.reset_for_new_session()
             self._post_system("Conversation cleared.")
@@ -321,6 +428,9 @@ class ReplScreen(Screen):
 
         elif cmd == "/output-style":
             self._cmd_output_style(arg)
+
+        elif cmd == "/theme":
+            self._cmd_theme(arg)
 
         # ── Context / memory ─────────────────────────────────────────────
         elif cmd == "/context":
@@ -572,6 +682,31 @@ class ReplScreen(Screen):
             self._thinking_config = {"type": "disabled"}
         self._post_system(f"Effort set to: [bold]{arg}[/bold]  (thinking budget: {budget:,} tokens)")
 
+    def _cmd_theme(self, arg: str) -> None:
+        """commands/theme — list or switch the active theme (themes.py)."""
+        from optimus.tui.themes import THEME_NAMES, set_active_theme, active_theme_name
+        if not arg:
+            lines = [f"[bold {ACCENT}]Themes[/bold {ACCENT}]\n"]
+            for name in THEME_NAMES:
+                marker = "▶ " if name == active_theme_name() else "  "
+                lines.append(f"  {marker}{name}")
+            lines.append("\n  Usage: /theme <name>")
+            lines.append(
+                "  [dim]RE-ENTRY: live restyling — widgets currently load the "
+                "dark palette at import; switching takes effect for new "
+                "widgets only.[/dim]"
+            )
+            self._post_system("\n".join(lines))
+            return
+        if arg not in THEME_NAMES:
+            self._post_system(
+                f"Unknown theme: [bold]{arg}[/bold]\n"
+                f"Available: {', '.join(THEME_NAMES)}"
+            )
+            return
+        set_active_theme(arg)
+        self._post_system(f"Theme set to: [bold]{arg}[/bold]")
+
     def _cmd_output_style(self, arg: str) -> None:
         styles = {"verbose", "concise", "auto"}
         if arg not in styles:
@@ -685,23 +820,18 @@ class ReplScreen(Screen):
 
     def _cmd_permissions(self) -> None:
         mode = self.query_one("#status-bar", StatusBar).permission_mode
-        session_grants = list(self._perm_manager._session_grants.keys())
-        permanent_grants = list(self._perm_manager._permanent_grants)
+        remembered = self._perm_manager.remembered_rules()
         lines = [
             f"[bold {ACCENT}]Permission State[/bold {ACCENT}]\n",
             f"  Mode : [bold]{mode}[/bold]\n",
             f"  Allowed dirs : {', '.join(self._allowed_dirs) or os.getcwd()}",
         ]
-        if session_grants:
-            lines.append("\n  Session approvals:")
-            for tool, fp in session_grants:
-                lines.append(f"    {tool} — {fp[:50] or '(any)'}")
-        if permanent_grants:
-            lines.append("\n  Permanent approvals:")
-            for tool, fp in permanent_grants:
-                lines.append(f"    {tool} — {fp[:50] or '(any)'}")
-        if not session_grants and not permanent_grants:
-            lines.append("\n  No pre-approvals recorded yet.")
+        if remembered:
+            lines.append("\n  Remembered rules (\"don't ask again\"):")
+            for tool, rule in remembered:
+                lines.append(f"    {tool} — {rule[:50] or '(any)'}")
+        else:
+            lines.append("\n  No remembered rules yet.")
         self._post_system("\n".join(lines))
 
     async def _cmd_diff(self, path: str) -> None:
@@ -936,6 +1066,8 @@ class ReplScreen(Screen):
             "This summary will replace the current history."
         )
         await self._run_query(compact_prompt)
+        # CompactBoundaryMessage: "✻ Conversation compacted (ctrl+o for history)"
+        self.query_one("#message-list", MessageList).add_compact_boundary()
 
     async def _export_conversation(self, filename: str) -> None:
         try:
@@ -972,22 +1104,27 @@ class ReplScreen(Screen):
         self._set_waiting(True)
         self._cancel_event.clear()
 
-        # Create assistant message placeholder
+        # Create assistant message placeholder + the SpinnerWithVerb line
+        # (pinned in #spinner-slot above the input bar, not in the scroll)
         assistant_widget = ml.add_assistant_message(streaming=True)
+        spinner = self._show_spinner()
 
         try:
             self._query_task = asyncio.create_task(
-                self._stream_query(user_text, assistant_widget)
+                self._stream_query(user_text, assistant_widget, spinner)
             )
             await self._query_task
         except asyncio.CancelledError:
-            assistant_widget.finish_streaming("[dim italic]Cancelled.[/dim italic]")
+            # InterruptedByUser: dim "Interrupted · …" line, no error styling
+            assistant_widget.finish_streaming("")
+            ml.add_interrupted()
         except Exception as exc:
             err_msg = f"Query error: {exc}"
             if self._debug:
                 err_msg += f"\n{traceback.format_exc()}"
             ml.add_error_message(err_msg)
         finally:
+            self._hide_spinner()
             self._set_waiting(False)
             self._query_task = None
             input_bar.focus_input()
@@ -996,6 +1133,7 @@ class ReplScreen(Screen):
         self,
         user_text: str,
         assistant_widget: MessageWidget,
+        spinner=None,
     ) -> None:
         """
         Inner coroutine: imports query() and streams events into assistant_widget.
@@ -1080,6 +1218,10 @@ class ReplScreen(Screen):
                 if text:
                     assistant_widget.append_text(text)
                     output_parts.append(text)
+                    if spinner is not None:
+                        # Feeds the token counter + resets stall detection
+                        spinner.add_response_chars(len(text))
+                        spinner.set_thinking(False)
 
             # ── Complete assistant message ────────────────────────────
             elif etype == "assistant":
@@ -1100,6 +1242,12 @@ class ReplScreen(Screen):
                     elif btype == "thinking":
                         thinking = block.get("thinking", "")
                         assistant_widget.set_thinking(thinking)
+                        if spinner is not None:
+                            # Complete thinking block: pulse the spinner's
+                            # thinking status through start→end so it shows
+                            # "thought for Ns" per the 2s-minimum rule.
+                            spinner.set_thinking(True)
+                            spinner.set_thinking(False)
                     elif btype == "tool_use":
                         tool_id = block.get("id", str(uuid.uuid4()))
                         tool_name = block.get("name", "Unknown")
@@ -1112,6 +1260,8 @@ class ReplScreen(Screen):
                         )
                         assistant_widget.add_tool_call(tc)
                         current_tool_id = tool_id
+                        if spinner is not None:
+                            spinner.set_active_tools(True)
 
                 # Accumulate token usage from this assistant message
                 usage = msg.get("usage", {})
@@ -1144,6 +1294,8 @@ class ReplScreen(Screen):
                         assistant_widget.update_tool_result(
                             tool_id, str(result_content), is_error=is_error,
                         )
+                        if spinner is not None:
+                            spinner.set_active_tools(False)
 
             # ── Attachment message ────────────────────────────────────
             elif etype == "attachment":
@@ -1181,7 +1333,18 @@ class ReplScreen(Screen):
         Returns a callable suitable for QueryParams.can_use_tool.
         Checks the permission manager; if no pre-approval, shows a modal.
         """
+        _EDIT_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit", "FileWrite", "FileEdit"}
+
         async def can_use_tool(tool_name: str, tool_input: dict) -> bool:
+            # acceptEdits mode: file-edit tools skip the prompt
+            # (utils/permissions — acceptEdits auto-allows edit rules).
+            if self._permission_mode == "acceptEdits" and tool_name in _EDIT_TOOLS:
+                return True
+            # plan mode: edit tools are refused without prompting — the
+            # model is told to plan, not to modify the working tree.
+            if self._permission_mode == "plan" and tool_name in _EDIT_TOOLS:
+                return False
+
             req = build_permission_request(
                 request_id=str(uuid.uuid4()),
                 tool_name=tool_name,
@@ -1197,18 +1360,14 @@ class ReplScreen(Screen):
             self._perm_manager.record(req, decision)
             return decision in (
                 PermissionLevel.ALLOW_ONCE,
-                PermissionLevel.ALLOW_SESSION,
-                PermissionLevel.ALLOW_PERMANENT,
+                PermissionLevel.ALLOW_REMEMBER,
             )
 
         return can_use_tool
 
     async def _show_permission_modal(self, req: PermissionRequest) -> str:
-        """Push the appropriate modal and await the user's decision."""
-        if req.risk_level in ("high", "critical"):
-            modal = DangerousPermissionModal(req)
-        else:
-            modal = PermissionModal(req)
+        """Push the permission modal and await the user's Yes/Remember/No decision."""
+        modal = PermissionModal(req)
         # push_screen_wait suspends until modal is dismissed
         result = await self.app.push_screen_wait(modal)
         return result or PermissionLevel.DENY

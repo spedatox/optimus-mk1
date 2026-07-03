@@ -1,552 +1,228 @@
 """
 optimus/tui/components/permission.py
 
-Permission-request modal dialogs for Optimus TUI.
+Port of: components/permissions/PermissionDialog.tsx (shared chrome),
+         components/permissions/PermissionRequestTitle.tsx,
+         components/permissions/shellPermissionHelpers.tsx (generateShellSuggestionsLabel),
+         components/permissions/BashPermissionRequest/bashToolUseOptions.tsx,
+         components/permissions/FileEditPermissionRequest, WebFetchPermissionRequest, etc.
 
-Port of: components/permissions/ (Claude Code React modals).
-Covers all 20+ permission types: bash, file read/write, glob, grep,
-web fetch, agent launch, notebook edit, etc.
+Real Claude Code never shows "Allow Once / Allow Session / Allow Permanently /
+Deny" buttons. Every permission dialog is an arrow-key Select with exactly two
+or three rows:
 
-Each PermissionRequest is posted as a Textual message from the REPL screen
-when the query loop asks `can_use_tool`. The modal suspends the query coroutine
-via an asyncio.Event until the user responds.
+    Yes
+    Yes, and don't ask again for <rule>      (only when a rule can be generated
+                                               for this tool — bashToolUseOptions
+                                               only adds it when suggestions exist)
+    No
+
+Escape / Ctrl+C on the Select resolves to "No" (PermissionRequest onCancel in
+BashPermissionRequest.tsx: `onCancel={() => handleReject()}`).
+
+The chrome is PermissionDialog.tsx: a Box with a ROUND border but only the top
+edge drawn (borderLeft/Right/Bottom={false}), title bold-colored "permission"
+(#b1b9f9) by default, an optional dim subtitle (command/path preview, truncated
+from the start), and padded body content.
+
+RE-ENTRY: real "don't ask again" writes a PermissionRule into settings.json
+(project or user scope) via utils/permissions/permissionsLoader.ts. Optimus has
+no settings persistence yet, so remembered rules live only for the process
+lifetime (not cleared by /clear, matching the fact that real permission rules
+survive /clear too). Also not ported: the Haiku-generated classifier
+descriptions, editable-prefix input mode, and hook/rule "why am I being asked"
+explanation banner (PermissionRuleExplanation.tsx) — Optimus's permission
+requests are all mode='ask', so there is no persisted-rule/hook reason to show.
 """
 from __future__ import annotations
 
-import asyncio
+import os
 from dataclasses import dataclass, field
 from typing import Optional, Any
+from urllib.parse import urlparse
 
 from textual.app import ComposeResult
-from textual.widget import Widget
-from textual.widgets import Static, Button, Label, Input
-from textual.containers import Vertical, Horizontal, ScrollableContainer
+from textual.widgets import Static, Button, Input
+from textual.containers import Vertical, Horizontal
 from textual.screen import ModalScreen
-from textual.message import Message as TMessage
+from textual.widgets import OptionList
+from textual.widgets.option_list import Option
 
 
 # ---------------------------------------------------------------------------
-# Permission-level constants (mirrors PermissionLevel in TS)
+# Permission-level constants
 # ---------------------------------------------------------------------------
 
 class PermissionLevel:
-    ALLOW_ONCE          = "allow_once"
-    ALLOW_SESSION       = "allow_session"
-    ALLOW_PERMANENT     = "allow_permanent"
-    DENY                = "deny"
-    DENY_PERMANENT      = "deny_permanent"
+    ALLOW_ONCE      = "allow_once"       # "Yes"
+    ALLOW_REMEMBER  = "allow_remember"   # "Yes, and don't ask again for <rule>"
+    DENY            = "deny"             # "No" / Escape / Ctrl+C
 
 
 # ---------------------------------------------------------------------------
-# PermissionRequest dataclass — describes what the agent wants to do
+# PermissionRequest dataclass — one instance per tool-call needing approval
 # ---------------------------------------------------------------------------
 
 @dataclass
 class PermissionRequest:
-    """
-    Mirrors the TS ToolUseBlock with permission metadata.
-    One instance per tool-call that needs approval.
-    """
-    request_id: str                          # matches ToolCall.id
-    tool_name: str                           # e.g. "Bash", "Write", "WebFetch"
-    description: str                         # human-readable action summary
-    details: dict[str, Any] = field(default_factory=dict)   # raw tool input
-    risk_level: str = "low"                  # "low" | "medium" | "high" | "critical"
+    request_id: str
+    tool_name: str
+    description: str                                   # PermissionRequestTitle "title"
+    details: dict[str, Any] = field(default_factory=dict)
+    risk_level: str = "low"                             # low | medium | high | critical
 
-    # Set by the modal when the user responds
-    _result_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
-    _decision: Optional[str] = field(default=None, repr=False)
-
-    def resolve(self, decision: str) -> None:
-        """Called by the modal button handlers."""
-        self._decision = decision
-        self._result_event.set()
-
-    async def wait_for_decision(self) -> str:
-        """
-        Awaited by the query loop's can_use_tool callback.
-        Blocks until the user clicks Allow/Deny in the modal.
-        """
-        await self._result_event.wait()
-        return self._decision or PermissionLevel.DENY
+    # A "don't ask again" rule, if one can be generated for this tool/input.
+    rule_label: Optional[str] = None                    # e.g. "git commands in ~/proj"
+    rule_key: Optional[str] = None                       # the prefix/dir/domain to match against
+    rule_scope: Optional[str] = None                     # the subject checked against rule_key
 
 
 # ---------------------------------------------------------------------------
-# Risk colours
+# Rule generation — mirrors shellPermissionHelpers.generateShellSuggestionsLabel
 # ---------------------------------------------------------------------------
 
-_RISK_COLOUR: dict[str, str] = {
-    "low":      "#b1b9f9",
-    "medium":   "#f0a500",
-    "high":     "#ff6b35",
-    "critical": "#ff2222",
-}
-
-_RISK_LABEL: dict[str, str] = {
-    "low":      "LOW RISK",
-    "medium":   "MEDIUM RISK",
-    "high":     "HIGH RISK",
-    "critical": "CRITICAL",
-}
-
-# ---------------------------------------------------------------------------
-# Tool-specific detail renderers
-# ---------------------------------------------------------------------------
-
-def _render_bash_details(details: dict) -> str:
-    cmd = details.get("command", "")
-    timeout = details.get("timeout", "")
-    lines = cmd.splitlines()
-    preview = "\n".join(lines[:10])
-    if len(lines) > 10:
-        preview += f"\n… ({len(lines) - 10} more lines)"
-    out = f"[bold]Command:[/bold]\n{preview}"
-    if timeout:
-        out += f"\n\n[dim]Timeout: {timeout}ms[/dim]"
-    return out
-
-
-def _render_file_write_details(details: dict) -> str:
-    path = details.get("file_path") or details.get("path", "?")
-    content = details.get("content") or details.get("new_string", "")
-    preview = (content[:300] + "…") if len(content) > 300 else content
-    return f"[bold]File:[/bold] {path}\n\n[bold]Content preview:[/bold]\n{preview}"
-
-
-def _render_file_read_details(details: dict) -> str:
-    path = details.get("file_path") or details.get("path", "?")
-    return f"[bold]File:[/bold] {path}"
-
-
-def _render_web_fetch_details(details: dict) -> str:
-    url = details.get("url", "?")
-    return f"[bold]URL:[/bold] {url}"
-
-
-def _render_glob_details(details: dict) -> str:
-    pattern = details.get("pattern", "?")
-    path = details.get("path", "")
-    out = f"[bold]Pattern:[/bold] {pattern}"
-    if path:
-        out += f"\n[bold]In:[/bold] {path}"
-    return out
-
-
-def _render_grep_details(details: dict) -> str:
-    pattern = details.get("pattern", "?")
-    path = details.get("path", "")
-    out = f"[bold]Pattern:[/bold] {pattern}"
-    if path:
-        out += f"\n[bold]In:[/bold] {path}"
-    return out
-
-
-def _render_agent_details(details: dict) -> str:
-    desc = details.get("description", "")
-    prompt = details.get("prompt", "")[:200]
-    return f"[bold]Agent task:[/bold]\n{desc or prompt}"
-
-
-def _render_generic_details(details: dict) -> str:
-    parts: list[str] = []
-    for k, v in list(details.items())[:6]:
-        val = str(v)
-        if len(val) > 80:
-            val = val[:80] + "…"
-        parts.append(f"[bold]{k}:[/bold] {val}")
-    return "\n".join(parts)
-
-
-_DETAIL_RENDERERS = {
-    "Bash":         _render_bash_details,
-    "Write":        _render_file_write_details,
-    "Edit":         _render_file_write_details,
-    "MultiEdit":    _render_file_write_details,
-    "Read":         _render_file_read_details,
-    "Glob":         _render_glob_details,
-    "Grep":         _render_grep_details,
-    "WebFetch":     _render_web_fetch_details,
-    "WebSearch":    _render_web_fetch_details,
-    "Agent":        _render_agent_details,
-    "Task":         _render_agent_details,
-    "NotebookEdit": _render_file_write_details,
-    "NotebookRead": _render_file_read_details,
+_MULTI_WORD_TOOLS = {
+    "npm", "yarn", "pnpm", "bun", "deno",
+    "git", "cargo", "go", "docker", "kubectl", "poetry", "pip",
 }
 
 
-def render_permission_details(req: PermissionRequest) -> str:
-    renderer = _DETAIL_RENDERERS.get(req.tool_name, _render_generic_details)
-    return renderer(req.details)
+def _bash_prefix(command: str) -> Optional[str]:
+    """Mirrors getSimpleCommandPrefix (simplified): first token, plus the
+    immediate subcommand for well-known multi-word CLIs (git, npm run, ...)."""
+    first_line = command.strip().splitlines()[0] if command.strip() else ""
+    tokens = first_line.split()
+    if not tokens:
+        return None
+    head = tokens[0].rsplit("/", 1)[-1]
+    if head in _MULTI_WORD_TOOLS and len(tokens) > 1:
+        return f"{head} {tokens[1]}"
+    return head
 
 
-# ---------------------------------------------------------------------------
-# PermissionModal — the actual Textual screen
-# ---------------------------------------------------------------------------
+def _domain_of(url: str) -> Optional[str]:
+    try:
+        return urlparse(url).netloc or None
+    except Exception:
+        return None
 
-class PermissionModal(ModalScreen[str]):
+
+def _short_cwd() -> str:
+    cwd = os.getcwd()
+    home = os.path.expanduser("~")
+    if cwd.startswith(home):
+        cwd = "~" + cwd[len(home):]
+    return cwd
+
+
+def _build_rule(tool_name: str, details: dict) -> tuple[Optional[str], Optional[str], Optional[str]]:
     """
-    Full-screen modal that suspends the TUI until the user
-    grants or denies the requested tool call.
-
-    Port of: PermissionDialog.tsx / PermissionModal.tsx
+    Returns (rule_label, rule_key, rule_scope) or (None, None, None) if this
+    tool/input doesn't support a "don't ask again" suggestion — matching real
+    Claude Code where bashToolUseOptions only adds the option when
+    suggestions.length > 0.
     """
+    if tool_name == "Bash":
+        command = details.get("command", "")
+        prefix = _bash_prefix(command)
+        if not prefix:
+            return None, None, None
+        label = f"Yes, and don't ask again for `{prefix}` commands in {_short_cwd()}"
+        return label, prefix, command
 
-    DEFAULT_CSS = """
-    PermissionModal {
-        align: center middle;
-        background: rgba(5, 10, 30, 0.85);
-    }
-    PermissionModal > Vertical {
-        width: 70;
-        max-width: 90%;
-        height: auto;
-        background: #0a1628;
-        border: solid #264f78;
-        padding: 1 2;
-    }
-    PermissionModal .perm-title {
-        text-align: center;
-        color: #b1b9f9;
-        text-style: bold;
-        margin-bottom: 1;
-    }
-    PermissionModal .perm-risk {
-        text-align: center;
-        margin-bottom: 1;
-    }
-    PermissionModal .perm-description {
-        color: #ffffff;
-        margin-bottom: 1;
-    }
-    PermissionModal .perm-details-box {
-        background: #1a1a1a;
-        border: solid #264f78;
-        padding: 0 1;
-        height: auto;
-        max-height: 10;
-        margin-bottom: 1;
-        overflow-y: auto;
-        color: #a0b4c8;
-    }
-    PermissionModal .perm-hint {
-        color: #2a4a6a;
-        text-align: center;
-        margin-bottom: 1;
-    }
-    PermissionModal .perm-buttons {
-        height: 3;
-        align: center middle;
-    }
-    PermissionModal Button {
-        margin: 0 1;
-        min-width: 14;
-    }
-    PermissionModal #btn-allow-once {
-        background: #003a5c;
-        color: #b1b9f9;
-        border: solid #005f88;
-    }
-    PermissionModal #btn-allow-once:hover {
-        background: #005f88;
-    }
-    PermissionModal #btn-allow-session {
-        background: #003a3a;
-        color: #00d4a0;
-        border: solid #006655;
-    }
-    PermissionModal #btn-allow-session:hover {
-        background: #006655;
-    }
-    PermissionModal #btn-deny {
-        background: #3a0a0a;
-        color: #ff6b6b;
-        border: solid #6a2020;
-    }
-    PermissionModal #btn-deny:hover {
-        background: #6a2020;
-    }
-    """
+    if tool_name in ("Read", "Glob", "Grep", "NotebookRead"):
+        path = details.get("file_path") or details.get("path", "")
+        if not path:
+            return None, None, None
+        directory = os.path.dirname(path) or path
+        dirname = os.path.basename(directory) or directory
+        label = f"Yes, and allow reading from {dirname}/ from this project"
+        return label, directory, path
 
-    BINDINGS = [
-        ("y",      "allow_once",    "Allow Once"),
-        ("s",      "allow_session", "Allow for Session"),
-        ("n",      "deny",          "Deny"),
-        ("escape", "deny",          "Deny"),
-    ]
+    if tool_name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+        path = details.get("file_path") or details.get("path", "")
+        if not path:
+            return None, None, None
+        directory = os.path.dirname(path) or path
+        dirname = os.path.basename(directory) or directory
+        label = f"Yes, and always allow access to {dirname}/ from this project"
+        return label, directory, path
 
-    def __init__(self, request: PermissionRequest, **kwargs) -> None:
-        super().__init__(**kwargs)
-        self._req = request
+    if tool_name in ("WebFetch", "WebSearch"):
+        url = details.get("url") or details.get("query", "")
+        domain = _domain_of(url)
+        if not domain:
+            return None, None, None
+        label = f"Yes, and always allow requests to {domain}"
+        return label, domain, url
 
-    def compose(self) -> ComposeResult:
-        req = self._req
-        risk_colour = _RISK_COLOUR.get(req.risk_level, "#b1b9f9")
-        risk_label  = _RISK_LABEL.get(req.risk_level, "UNKNOWN")
-        details_text = render_permission_details(req)
+    # Agent/Task/MCP/other tools: no rule suggestion (matches real behaviour —
+    # only Bash/file/web tools produce PermissionUpdate suggestions).
+    return None, None, None
 
-        with Vertical():
-            yield Static(
-                f"[bold #b1b9f9]◈  PERMISSION REQUEST[/bold #b1b9f9]",
-                classes="perm-title",
-            )
-            yield Static(
-                f"[bold {risk_colour}]▲ {risk_label}[/bold {risk_colour}]",
-                classes="perm-risk",
-            )
-            yield Static(
-                f"[bold]{req.tool_name}[/bold] — {req.description}",
-                classes="perm-description",
-            )
-            if details_text:
-                yield Static(details_text, classes="perm-details-box")
-            yield Static(
-                "  [dim]y[/dim] Allow Once  "
-                "  [dim]s[/dim] Allow Session  "
-                "  [dim]n / Esc[/dim] Deny",
-                classes="perm-hint",
-            )
-            with Horizontal(classes="perm-buttons"):
-                yield Button("Allow Once (y)",    id="btn-allow-once",    variant="primary")
-                yield Button("Allow Session (s)", id="btn-allow-session", variant="success")
-                yield Button("Deny (n)",          id="btn-deny",          variant="error")
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        event.stop()
-        if event.button.id == "btn-allow-once":
-            self._resolve(PermissionLevel.ALLOW_ONCE)
-        elif event.button.id == "btn-allow-session":
-            self._resolve(PermissionLevel.ALLOW_SESSION)
-        else:
-            self._resolve(PermissionLevel.DENY)
-
-    def action_allow_once(self) -> None:
-        self._resolve(PermissionLevel.ALLOW_ONCE)
-
-    def action_allow_session(self) -> None:
-        self._resolve(PermissionLevel.ALLOW_SESSION)
-
-    def action_deny(self) -> None:
-        self._resolve(PermissionLevel.DENY)
-
-    def _resolve(self, decision: str) -> None:
-        self._req.resolve(decision)
-        self.dismiss(decision)
-
-
-# ---------------------------------------------------------------------------
-# DangerousPermissionModal — extended dialog for high-risk operations
-# ---------------------------------------------------------------------------
-
-class DangerousPermissionModal(PermissionModal):
-    """
-    Variant for high/critical risk: adds a permanent-allow option
-    and shows a stronger warning. Port of DangerousCommandDialog.tsx.
-    """
-
-    DEFAULT_CSS = PermissionModal.DEFAULT_CSS + """
-    DangerousPermissionModal > Vertical {
-        border: solid #ff2222;
-    }
-    DangerousPermissionModal .perm-warning {
-        color: #ff6b6b;
-        text-align: center;
-        text-style: bold;
-        margin: 0 0 1 0;
-    }
-    DangerousPermissionModal #btn-allow-permanent {
-        background: #4a1a00;
-        color: #ff9933;
-        border: solid #8a3a00;
-    }
-    DangerousPermissionModal #btn-allow-permanent:hover {
-        background: #8a3a00;
-    }
-    """
-
-    BINDINGS = [
-        ("y",      "allow_once",      "Allow Once"),
-        ("s",      "allow_session",   "Allow Session"),
-        ("p",      "allow_permanent", "Allow Permanently"),
-        ("n",      "deny",            "Deny"),
-        ("escape", "deny",            "Deny"),
-    ]
-
-    def compose(self) -> ComposeResult:
-        req = self._req
-        risk_colour = _RISK_COLOUR.get(req.risk_level, "#ff6b6b")
-        details_text = render_permission_details(req)
-
-        with Vertical():
-            yield Static(
-                f"[bold #ff2222]⚠  DANGEROUS OPERATION[/bold #ff2222]",
-                classes="perm-title",
-            )
-            yield Static(
-                f"[bold {risk_colour}]This action may be irreversible.[/bold {risk_colour}]",
-                classes="perm-warning",
-            )
-            yield Static(
-                f"[bold]{req.tool_name}[/bold] — {req.description}",
-                classes="perm-description",
-            )
-            if details_text:
-                yield Static(details_text, classes="perm-details-box")
-            yield Static(
-                "  [dim]y[/dim] Once  [dim]s[/dim] Session  "
-                "  [dim]p[/dim] Permanent  [dim]n/Esc[/dim] Deny",
-                classes="perm-hint",
-            )
-            with Horizontal(classes="perm-buttons"):
-                yield Button("Allow Once",        id="btn-allow-once",      variant="primary")
-                yield Button("Allow Session",      id="btn-allow-session",   variant="success")
-                yield Button("Allow Permanently",  id="btn-allow-permanent")
-                yield Button("Deny (n)",           id="btn-deny",            variant="error")
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        event.stop()
-        if event.button.id == "btn-allow-once":
-            self._resolve(PermissionLevel.ALLOW_ONCE)
-        elif event.button.id == "btn-allow-session":
-            self._resolve(PermissionLevel.ALLOW_SESSION)
-        elif event.button.id == "btn-allow-permanent":
-            self._resolve(PermissionLevel.ALLOW_PERMANENT)
-        else:
-            self._resolve(PermissionLevel.DENY)
-
-    def action_allow_permanent(self) -> None:
-        self._resolve(PermissionLevel.ALLOW_PERMANENT)
-
-
-# ---------------------------------------------------------------------------
-# PermissionManager — tracks per-session and permanent grants
-# ---------------------------------------------------------------------------
-
-class PermissionManager:
-    """
-    Tracks which (tool_name, fingerprint) pairs have been approved for this
-    session or permanently.
-
-    Port of: the in-memory permission state in permissionsContext.ts.
-    """
-
-    def __init__(self) -> None:
-        # (tool_name, fingerprint) → PermissionLevel
-        self._session_grants: dict[tuple[str, str], str] = {}
-        self._permanent_grants: set[tuple[str, str]] = set()
-
-    def record(self, req: PermissionRequest, decision: str) -> None:
-        """Record the user's decision for future calls."""
-        key = (req.tool_name, self._fingerprint(req))
-        if decision == PermissionLevel.ALLOW_SESSION:
-            self._session_grants[key] = decision
-        elif decision == PermissionLevel.ALLOW_PERMANENT:
-            self._permanent_grants.add(key)
-
-    def is_pre_approved(self, req: PermissionRequest) -> bool:
-        """Return True if this tool call is already approved."""
-        key = (req.tool_name, self._fingerprint(req))
-        return key in self._permanent_grants or key in self._session_grants
-
-    def clear_session_grants(self) -> None:
-        self._session_grants.clear()
-
-    @staticmethod
-    def _fingerprint(req: PermissionRequest) -> str:
-        """
-        A short string that identifies the "scope" of the permission.
-        For Bash: the command. For Write: the file path. Etc.
-        """
-        details = req.details
-        if req.tool_name == "Bash":
-            return details.get("command", "")[:120]
-        if req.tool_name in ("Write", "Edit", "MultiEdit"):
-            return details.get("file_path") or details.get("path", "")
-        if req.tool_name in ("Read",):
-            return details.get("file_path") or details.get("path", "")
-        if req.tool_name in ("WebFetch", "WebSearch"):
-            return details.get("url", "")
-        return ""
-
-
-# ---------------------------------------------------------------------------
-# Helpers for the REPL screen
-# ---------------------------------------------------------------------------
 
 def build_permission_request(
     request_id: str,
     tool_name: str,
     tool_input: dict,
 ) -> PermissionRequest:
-    """
-    Construct a PermissionRequest from a raw tool-use block.
-    Infers the risk level and human-readable description from the tool name + input.
-    """
+    """Construct a PermissionRequest from a raw tool-use block."""
     description = _describe_tool_use(tool_name, tool_input)
     risk = _infer_risk(tool_name, tool_input)
+    rule_label, rule_key, rule_scope = _build_rule(tool_name, tool_input)
     return PermissionRequest(
         request_id=request_id,
         tool_name=tool_name,
         description=description,
         details=tool_input,
         risk_level=risk,
+        rule_label=rule_label,
+        rule_key=rule_key,
+        rule_scope=rule_scope,
     )
 
 
 def _describe_tool_use(tool_name: str, inp: dict) -> str:
-    """One-line human description of what the tool call will do."""
+    """PermissionRequestTitle's bold title line."""
     if tool_name == "Bash":
         cmd = inp.get("command", "").split("\n")[0][:60]
-        return f"Run shell command: {cmd}"
+        return f"Bash command: {cmd}"
     if tool_name == "Write":
-        path = inp.get("file_path") or inp.get("path", "?")
-        return f"Write to file: {path}"
+        return f"Write file: {inp.get('file_path') or inp.get('path', '?')}"
     if tool_name == "Edit":
-        path = inp.get("file_path") or inp.get("path", "?")
-        return f"Edit file: {path}"
+        return f"Edit file: {inp.get('file_path') or inp.get('path', '?')}"
     if tool_name == "MultiEdit":
-        path = inp.get("file_path") or inp.get("path", "?")
-        return f"Make multiple edits to: {path}"
+        return f"Edit file: {inp.get('file_path') or inp.get('path', '?')}"
     if tool_name == "Read":
-        path = inp.get("file_path") or inp.get("path", "?")
-        return f"Read file: {path}"
+        return f"Read file: {inp.get('file_path') or inp.get('path', '?')}"
     if tool_name == "Glob":
-        return f"Find files matching: {inp.get('pattern', '?')}"
+        return f"Find files: {inp.get('pattern', '?')}"
     if tool_name == "Grep":
-        return f"Search code for: {inp.get('pattern', '?')}"
+        return f"Search code: {inp.get('pattern', '?')}"
     if tool_name in ("WebFetch", "WebSearch"):
         return f"Fetch from web: {inp.get('url') or inp.get('query', '?')}"
     if tool_name in ("Agent", "Task"):
         desc = inp.get("description", inp.get("prompt", ""))[:80]
         return f"Launch sub-agent: {desc}"
     if tool_name == "NotebookEdit":
-        path = inp.get("notebook_path", "?")
-        return f"Edit notebook: {path}"
+        return f"Edit notebook: {inp.get('notebook_path', '?')}"
     return f"Use tool: {tool_name}"
 
 
 def _infer_risk(tool_name: str, inp: dict) -> str:
-    """
-    Classify the risk of a tool call.
-    Mirrors the TS tool-risk assessment logic.
-    """
     if tool_name == "Bash":
         cmd = inp.get("command", "")
-        # Critical: destructive commands
         critical_patterns = [
             "rm -rf", "rm -r", "mkfs", "dd if=", ":(){", "chmod 777",
             "curl | sh", "wget | sh", "sudo rm", "> /etc",
         ]
-        for pat in critical_patterns:
-            if pat in cmd:
-                return "critical"
-        # High: network exfil, writes to system dirs
+        if any(pat in cmd for pat in critical_patterns):
+            return "critical"
         high_patterns = ["curl", "wget", "nc ", "ncat", "/etc/", "/sys/", "/proc/"]
-        for pat in high_patterns:
-            if pat in cmd:
-                return "high"
+        if any(pat in cmd for pat in high_patterns):
+            return "high"
         return "medium"
     if tool_name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
-        # Writing to system config files
         path = str(inp.get("file_path") or inp.get("path", ""))
         if any(path.startswith(p) for p in ("/etc/", "/sys/", "/boot/")):
             return "high"
@@ -559,7 +235,227 @@ def _infer_risk(tool_name: str, inp: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# AskUserQuestionModal — multiple-choice question dialog
+# Tool-specific detail renderers (the dim details box under the description)
+# ---------------------------------------------------------------------------
+
+def _render_bash_details(details: dict) -> str:
+    cmd = details.get("command", "")
+    lines = cmd.splitlines()
+    preview = "\n".join(lines[:10])
+    if len(lines) > 10:
+        preview += f"\n… ({len(lines) - 10} more lines)"
+    return preview
+
+
+def _render_edit_details(details: dict) -> str:
+    """FileEditPermissionRequest: word-level StructuredDiff of the edit."""
+    old = details.get("old_string")
+    new = details.get("new_string")
+    if old is not None and new is not None:
+        from optimus.tui.components.diff import render_edit_diff  # noqa: PLC0415
+        rendered = render_edit_diff(old, new, width=68)
+        if rendered:
+            lines = rendered.splitlines()
+            if len(lines) > 12:
+                rendered = "\n".join(lines[:12]) + f"\n[#999999]… +{len(lines) - 12} lines[/#999999]"
+            return rendered
+    content = details.get("new_string", "")
+    return (content[:300] + "…") if len(content) > 300 else content
+
+
+def _render_file_write_details(details: dict) -> str:
+    """FileWritePermissionRequest: diff against the existing file when it
+    exists, otherwise a plain content preview."""
+    path = details.get("file_path") or details.get("path", "")
+    content = details.get("content", "")
+    if path and os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                old = fh.read()
+            from optimus.tui.components.diff import render_edit_diff  # noqa: PLC0415
+            rendered = render_edit_diff(old, content, width=68)
+            if rendered:
+                lines = rendered.splitlines()
+                if len(lines) > 12:
+                    rendered = "\n".join(lines[:12]) + f"\n[#999999]… +{len(lines) - 12} lines[/#999999]"
+                return rendered
+        except OSError:
+            pass
+    return (content[:300] + "…") if len(content) > 300 else content
+
+
+def _render_generic_details(details: dict) -> str:
+    parts: list[str] = []
+    for k, v in list(details.items())[:6]:
+        if k in ("file_path", "path", "command", "pattern", "url", "query"):
+            continue
+        val = str(v)
+        if len(val) > 80:
+            val = val[:80] + "…"
+        parts.append(f"[bold]{k}:[/bold] {val}")
+    return "\n".join(parts)
+
+
+_DETAIL_RENDERERS = {
+    "Bash":         _render_bash_details,
+    "Write":        _render_file_write_details,
+    "Edit":         _render_edit_details,
+    "MultiEdit":    _render_edit_details,
+    "NotebookEdit": _render_edit_details,
+}
+
+
+def render_permission_details(req: PermissionRequest) -> str:
+    renderer = _DETAIL_RENDERERS.get(req.tool_name, _render_generic_details)
+    return renderer(req.details)
+
+
+_RISK_COLOUR: dict[str, str] = {
+    "low":      "#b1b9f9",   # theme.permission
+    "medium":   "#b1b9f9",
+    "high":     "#ffc107",   # theme.warning
+    "critical": "#ff6b80",   # theme.error
+}
+
+
+# ---------------------------------------------------------------------------
+# PermissionModal — port of PermissionDialog.tsx chrome + the Select options
+# ---------------------------------------------------------------------------
+
+class PermissionModal(ModalScreen[str]):
+    """
+    Suspends the TUI until the user picks Yes / Yes-remember / No.
+
+    Layout mirrors PermissionDialog.tsx: a box with only a top border (colored
+    by risk), a bold title + dim subtitle, and a body — here the body is the
+    details box followed by an OptionList (the CustomSelect port).
+    """
+
+    DEFAULT_CSS = """
+    PermissionModal {
+        align: center middle;
+        background: rgba(0, 0, 0, 0.6);
+    }
+    PermissionModal > Vertical {
+        width: 74;
+        max-width: 92%;
+        height: auto;
+        max-height: 30;
+        background: #1a1a1a;
+        padding: 1 2;
+    }
+    PermissionModal .perm-title {
+        text-style: bold;
+        margin-bottom: 0;
+    }
+    PermissionModal .perm-subtitle {
+        color: #999999;
+        margin-bottom: 1;
+    }
+    PermissionModal .perm-details-box {
+        background: #262626;
+        padding: 0 1;
+        height: auto;
+        max-height: 10;
+        margin-bottom: 1;
+        overflow-y: auto;
+        color: #999999;
+    }
+    PermissionModal OptionList {
+        height: auto;
+        max-height: 6;
+        background: #1a1a1a;
+        border: none;
+    }
+    """
+
+    BINDINGS = [
+        ("escape", "deny", "No"),
+    ]
+
+    def __init__(self, request: PermissionRequest, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._req = request
+        self._option_values: list[str] = []
+
+    def compose(self) -> ComposeResult:
+        req = self._req
+        colour = _RISK_COLOUR.get(req.risk_level, "#b1b9f9")
+        details_text = render_permission_details(req)
+
+        with Vertical():
+            yield Static(
+                f"[bold {colour}]▔▔▔ PERMISSION[/bold {colour}]",
+                classes="perm-title",
+            )
+            yield Static(
+                f"[bold {colour}]{req.description}[/bold {colour}]",
+                classes="perm-subtitle",
+            )
+            if details_text:
+                yield Static(details_text, classes="perm-details-box")
+
+            options: list[Option] = [Option("Yes", id="allow_once")]
+            self._option_values = ["allow_once"]
+            if req.rule_label:
+                options.append(Option(req.rule_label, id="allow_remember"))
+                self._option_values.append("allow_remember")
+            options.append(Option("No", id="deny"))
+            self._option_values.append("deny")
+
+            yield OptionList(*options, id="perm-options")
+
+    def on_mount(self) -> None:
+        self.query_one("#perm-options", OptionList).focus()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        event.stop()
+        self._resolve(event.option.id or PermissionLevel.DENY)
+
+    def action_deny(self) -> None:
+        self._resolve(PermissionLevel.DENY)
+
+    def _resolve(self, decision: str) -> None:
+        self.dismiss(decision)
+
+
+# ---------------------------------------------------------------------------
+# PermissionManager — tracks remembered ("don't ask again") rules
+# ---------------------------------------------------------------------------
+
+class PermissionManager:
+    """
+    Prefix/dir/domain rule matching, mirroring utils/permissions/permissionsLoader.ts
+    at the in-memory level: a remembered rule for Bash prefix "git" matches any
+    future command starting with "git", not just the exact original command.
+
+    Not cleared by /clear — real permission rules survive /clear too.
+    """
+
+    def __init__(self) -> None:
+        self._remembered: dict[str, set[str]] = {}   # tool_name -> {rule_key, ...}
+
+    def record(self, req: PermissionRequest, decision: str) -> None:
+        if decision == PermissionLevel.ALLOW_REMEMBER and req.rule_key:
+            self._remembered.setdefault(req.tool_name, set()).add(req.rule_key)
+
+    def is_pre_approved(self, req: PermissionRequest) -> bool:
+        keys = self._remembered.get(req.tool_name)
+        if not keys or req.rule_scope is None:
+            return False
+        return any(req.rule_scope.startswith(key) for key in keys)
+
+    def remembered_rules(self) -> list[tuple[str, str]]:
+        return [
+            (tool, key)
+            for tool, keys in self._remembered.items()
+            for key in keys
+        ]
+
+
+# ---------------------------------------------------------------------------
+# AskUserQuestionModal — multiple-choice question dialog (unrelated to the
+# Yes/No permission flow above; unchanged by this port pass).
 # ---------------------------------------------------------------------------
 
 class AskUserQuestionModal(ModalScreen[Optional[str]]):
@@ -578,50 +474,50 @@ class AskUserQuestionModal(ModalScreen[Optional[str]]):
     DEFAULT_CSS = """
     AskUserQuestionModal {
         align: center middle;
-        background: rgba(5, 10, 30, 0.85);
+        background: rgba(0, 0, 0, 0.6);
     }
     AskUserQuestionModal > Vertical {
         width: 72;
         max-width: 92%;
         height: auto;
         max-height: 80%;
-        background: #0a1628;
-        border: solid #264f78;
+        background: #1a1a1a;
+        border: solid #b1b9f9;
         padding: 1 2;
     }
     AskUserQuestionModal .aq-header {
-        color: #00d4ff;
+        color: #b1b9f9;
         text-style: bold;
         margin-bottom: 0;
     }
     AskUserQuestionModal .aq-question {
-        color: #e0e8ff;
+        color: #ffffff;
         margin-bottom: 1;
     }
     AskUserQuestionModal .aq-option {
-        background: #0f1d33;
-        border: solid #264f78;
+        background: #262626;
+        border: solid #505050;
         height: 3;
         margin-bottom: 0;
-        color: #c8d4e8;
+        color: #cccccc;
     }
     AskUserQuestionModal .aq-option:focus {
-        border: solid #00d4ff;
+        border: solid #b1b9f9;
         text-style: bold;
         color: #ffffff;
     }
     AskUserQuestionModal .aq-selected {
-        background: #003a5c;
-        border: solid #00d4ff;
+        background: #2c323e;
+        border: solid #b1b9f9;
         color: #ffffff;
     }
     AskUserQuestionModal .aq-hint {
-        color: #2a4a6a;
+        color: #505050;
         margin-top: 1;
     }
     AskUserQuestionModal #aq-other-input {
         margin-top: 0;
-        border: solid #264f78;
+        border: solid #505050;
     }
     AskUserQuestionModal .aq-buttons {
         height: 3;
@@ -629,13 +525,13 @@ class AskUserQuestionModal(ModalScreen[Optional[str]]):
         margin-top: 1;
     }
     AskUserQuestionModal #aq-submit {
-        background: #003a3a;
-        color: #00d4a0;
-        border: solid #006655;
+        background: #1a3a30;
+        color: #4eba65;
+        border: solid #2a5a45;
     }
     AskUserQuestionModal #aq-decline {
-        background: #3a0a0a;
-        color: #ff6b6b;
+        background: #2a0a0e;
+        color: #ff6b80;
         border: solid #6a2020;
     }
     """
@@ -655,7 +551,7 @@ class AskUserQuestionModal(ModalScreen[Optional[str]]):
         header = self._question.get("header", "")
         with Vertical():
             if header:
-                yield Static(f"[bold #00d4ff]◆ {header}[/bold #00d4ff]", classes="aq-header")
+                yield Static(f"[bold #b1b9f9]◆ {header}[/bold #b1b9f9]", classes="aq-header")
             yield Static(self._question.get("question", ""), classes="aq-question")
             for i, opt in enumerate(self._options):
                 label = opt.get("label", "")
@@ -680,8 +576,8 @@ class AskUserQuestionModal(ModalScreen[Optional[str]]):
 
     def _toggle(self, idx: int) -> None:
         if not self._multi:
-            # Single-select: clear any prior selection, then this one is chosen.
             self._selected.clear()
+            self._selected.add(idx)
             self._submit()
             return
         if idx in self._selected:
@@ -725,4 +621,3 @@ class AskUserQuestionModal(ModalScreen[Optional[str]]):
 
     def action_decline(self) -> None:
         self.dismiss(None)
-

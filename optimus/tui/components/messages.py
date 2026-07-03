@@ -43,16 +43,19 @@ MAX_DISPLAY_CHARS  = 10_000      # hard cap on displayed prompt text
 TRUNCATE_HEAD_CHARS = 2_500      # chars to show from the head
 TRUNCATE_TAIL_CHARS = 2_500      # chars to show from the tail
 
-# Braille spinner frames — the same set Claude Code uses for its loaders.
-SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+# Spinner glyph frames from Spinner/utils.ts getDefaultCharacters(), played
+# forward then reversed (Spinner.tsx SPINNER_FRAMES). NOT braille — Claude
+# Code has never used braille frames.
+from optimus.tui.components.spinner import SPINNER_FRAMES, FRAME_MS
 
 
 # ---------------------------------------------------------------------------
-# Spinner — animated single-cell loader (mirrors Claude Code's ToolUseLoader)
+# Spinner — animated single-cell glyph (SpinnerGlyph.tsx subset, used by
+# ToolPanel headers). The full verb/status line is SpinnerLine in spinner.py.
 # ---------------------------------------------------------------------------
 
 class Spinner(Static):
-    """A tiny animated spinner. Cycles SPINNER_FRAMES at ~12fps until stopped."""
+    """A tiny animated spinner. Cycles SPINNER_FRAMES every 120 ms until stopped."""
 
     DEFAULT_CSS = """
     Spinner {
@@ -69,7 +72,7 @@ class Spinner(Static):
         self._timer = None
 
     def on_mount(self) -> None:
-        self._timer = self.set_interval(1 / 12, self._tick)
+        self._timer = self.set_interval(FRAME_MS / 1000, self._tick)
         self._tick()
 
     def _tick(self) -> None:
@@ -87,6 +90,74 @@ class Spinner(Static):
 
     def on_unmount(self) -> None:
         self.stop()
+
+
+# ---------------------------------------------------------------------------
+# Assistant special-text handling — port of AssistantTextMessage.tsx's
+# switch(text). Each API-layer sentinel string maps to a dedicated rendering
+# (or to None → render nothing). Constants mirror services/api/errors.ts,
+# utils/messages.ts, services/compact/compact.ts so the display layer lines
+# up when those modules are ported.
+# ---------------------------------------------------------------------------
+
+API_ERROR_MESSAGE_PREFIX = "API Error"
+PROMPT_TOO_LONG_ERROR_MESSAGE = "Prompt is too long"
+CREDIT_BALANCE_TOO_LOW_ERROR_MESSAGE = "Credit balance is too low"
+INVALID_API_KEY_ERROR_MESSAGE = "Not logged in · Please run /login"
+INVALID_API_KEY_ERROR_MESSAGE_EXTERNAL = "Invalid API key · Fix external API key"
+API_TIMEOUT_ERROR_MESSAGE = "Request timed out"
+NO_RESPONSE_REQUESTED = "No response requested."
+ERROR_MESSAGE_USER_ABORT = "API Error: Request was aborted."
+INTERRUPT_MESSAGE = "[Request interrupted by user]"
+
+MAX_API_ERROR_CHARS = 1000     # AssistantTextMessage.tsx
+
+_ERROR_COLOUR = "#ff6b80"      # theme.error
+
+
+def render_special_assistant_text(text: str, verbose: bool = False) -> Optional[str]:
+    """
+    Returns Rich markup for API-layer sentinel strings, "" for
+    render-nothing sentinels, or None when the text is a normal response
+    (caller renders Markdown as usual).
+    """
+    stripped = text.strip()
+    if stripped == NO_RESPONSE_REQUESTED:
+        return ""
+    if stripped in (ERROR_MESSAGE_USER_ABORT, INTERRUPT_MESSAGE):
+        # InterruptedByUser.tsx (external branch)
+        return "[#999999]Interrupted · What should Optimus do instead?[/#999999]"
+    if stripped == PROMPT_TOO_LONG_ERROR_MESSAGE:
+        return (f"[{_ERROR_COLOUR}]Context limit reached · "
+                f"/compact or /clear to continue[/{_ERROR_COLOUR}]")
+    if stripped == CREDIT_BALANCE_TOO_LOW_ERROR_MESSAGE:
+        return (f"[{_ERROR_COLOUR}]Credit balance too low · Add funds: "
+                f"https://platform.claude.com/settings/billing[/{_ERROR_COLOUR}]")
+    if stripped in (INVALID_API_KEY_ERROR_MESSAGE, INVALID_API_KEY_ERROR_MESSAGE_EXTERNAL):
+        return (f"[{_ERROR_COLOUR}]Invalid or missing API key · "
+                f"Set ANTHROPIC_API_KEY[/{_ERROR_COLOUR}]")
+    if stripped.startswith(API_TIMEOUT_ERROR_MESSAGE):
+        hint = ""
+        timeout_env = os.environ.get("API_TIMEOUT_MS")
+        if timeout_env:
+            hint = f" (API_TIMEOUT_MS={timeout_env}ms, try increasing it)"
+        return f"[{_ERROR_COLOUR}]{API_TIMEOUT_ERROR_MESSAGE}{hint}[/{_ERROR_COLOUR}]"
+    if stripped.startswith(API_ERROR_MESSAGE_PREFIX):
+        if stripped == API_ERROR_MESSAGE_PREFIX:
+            body = f"{API_ERROR_MESSAGE_PREFIX}: Please wait a moment and try again."
+        elif not verbose and len(stripped) > MAX_API_ERROR_CHARS:
+            body = stripped[:MAX_API_ERROR_CHARS] + "…"
+        else:
+            body = stripped
+        return f"[{_ERROR_COLOUR}]{body}[/{_ERROR_COLOUR}]"
+    return None
+
+
+def extract_tag(text: str, tag: str) -> Optional[str]:
+    """utils/messages.ts extractTag — pull <tag>…</tag> content from text."""
+    import re as _re
+    m = _re.search(rf"<{tag}>(.*?)</{tag}>", text, _re.DOTALL)
+    return m.group(1) if m else None
 
 
 def _truncate_user_text(text: str) -> str:
@@ -130,29 +201,27 @@ class MessageData:
 
 
 # ---------------------------------------------------------------------------
-# ToolPanel — collapsible tool call display
-# Port of: various tool-use message components
-# Background: bashMessageBackgroundColor = rgb(65,60,65) = #413c41
+# ToolPanel — tool call display
+# Port of: ToolUseMessage / tool renderToolUseMessage rows.
+#
+# Claude Code renders tool calls flat on the terminal background:
+#
+#   ● Write(index.html)
+#     ⎿  File created successfully at: …
+#
+# No background block, no border. Dot is green on success, red on error,
+# the spinner glyph while running. Name is bold default-text with the args
+# summary in parens (not a coloured chip).
 # ---------------------------------------------------------------------------
 
 class ToolPanel(Widget):
-    """Displays a single tool call and its result. Click to toggle.
-
-    Claude Code replication:
-      - Header row: Spinner (animated, while running) or ✓/✗ (when done),
-        tool name in bold #b1b9f9, args summary.
-      - Result row: ⎿ prefix (Claude Code style), truncated at 2000 chars.
-      - Background: bashMessageBackgroundColor = #413c41
-      - Border-left: thick #b1b9f9
-    """
+    """Displays a single tool call and its result. Click to toggle."""
 
     DEFAULT_CSS = """
     ToolPanel {
         height: auto;
-        margin: 0 0 0 2;
-        background: #413c41;
-        border-left: thick #b1b9f9;
-        padding: 0 1;
+        margin: 0;
+        padding: 0;
     }
     ToolPanel .tp-header {
         height: auto;
@@ -168,30 +237,18 @@ class ToolPanel(Widget):
         content-align: left middle;
         padding: 0;
     }
-    ToolPanel .tp-name {
-        width: auto;
-        min-width: 12;
-        color: #b1b9f9;
-        text-style: bold;
-        content-align: left middle;
-    }
-    ToolPanel .tp-args {
+    ToolPanel .tp-title {
         width: 1fr;
-        color: #999999;
-        text-style: dim;
         content-align: left middle;
     }
     ToolPanel .tp-result {
         height: auto;
         margin: 0 0 0 2;
         padding: 0 0;
-        color: #cccccc;
+        color: #999999;
     }
     ToolPanel .tp-result.tool-result-error {
         color: #ff6b80;
-    }
-    ToolPanel .tp-result.tool-result-success {
-        color: #a0d9a0;
     }
     """
 
@@ -201,43 +258,74 @@ class ToolPanel(Widget):
         super().__init__(**kwargs)
         self._tool = tool_call
         self._spinner: Optional[Spinner] = None
+        # ctrl+o (CtrlOToExpand): show the full result instead of the
+        # truncated preview.
+        self._verbose = False
 
     def compose(self) -> ComposeResult:
         tool = self._tool
-        args_summary = self._summarise_args(tool.input)
+        args_summary = self._summarise_args(tool.input, tool.name)
 
-        # ── Header row ──────────────────────────────────────────────────
+        # ── Header row: ● Name(args) ────────────────────────────────────
         with Horizontal(classes="tp-header"):
             if tool.is_running:
                 # Animated Spinner — mounts, starts ticking, stops on unmount
                 yield Spinner(classes="tp-spinner-slot")
             elif tool.is_error:
                 yield Static(
-                    "[bold #ff6b80]✗[/bold #ff6b80]",
+                    "[#ff6b80]●[/#ff6b80]",
                     classes="tp-status-icon",
                 )
             else:
                 yield Static(
-                    "[bold #4eba65]✓[/bold #4eba65]",
+                    "[#4eba65]●[/#4eba65]",
                     classes="tp-status-icon",
                 )
 
-            yield Static(
-                f"[bold #b1b9f9]{tool.name}[/bold #b1b9f9]",
-                classes="tp-name",
-            )
-
+            title = f"[bold]{tool.name}[/bold]"
             if args_summary:
-                yield Static(
-                    f"[dim #999999]{args_summary[:60]}[/dim #999999]",
-                    classes="tp-args",
-                )
+                title += f"([#999999]{args_summary[:80]}[/#999999])"
+            yield Static(title, classes="tp-title")
+
+        # ── Edit/Write results: diff summary + StructuredDiff ───────────
+        # (FileEditToolResultMessage: "Updated <file> with N additions and
+        #  M removals" followed by the word-level diff.)
+        if (self.expanded and tool.result is not None and not tool.is_error
+                and tool.name in ("Edit", "FileEdit", "MultiEdit")
+                and isinstance(tool.input.get("old_string"), str)
+                and isinstance(tool.input.get("new_string"), str)):
+            summary, diff_markup = self._render_edit_result()
+            yield Static(
+                f"[dim #777777]⎿[/dim #777777] [#999999]{summary}[/#999999]",
+                classes="tp-result",
+            )
+            if diff_markup:
+                yield Static(diff_markup, classes="tp-result")
+            return
+
+        if (self.expanded and tool.result is not None and not tool.is_error
+                and tool.name in ("Write", "FileWrite")
+                and isinstance(tool.input.get("content"), str)):
+            path = self._summarise_args(tool.input, tool.name) or "file"
+            n_lines = tool.input["content"].count("\n") + 1
+            yield Static(
+                f"[dim #777777]⎿[/dim #777777] [#999999]Wrote {n_lines} "
+                f"lines to {path}[/#999999]",
+                classes="tp-result",
+            )
+            return
 
         # ── Result row (⎿ prefix — Claude Code style) ──────────────────
         if self.expanded and tool.result is not None:
-            result_text = tool.result[:2000]
-            if len(tool.result) > 2000:
-                result_text += f"\n… ({len(tool.result) - 2000} chars truncated)"
+            if self._verbose:
+                result_text = tool.result
+            else:
+                result_text = tool.result[:2000]
+                if len(tool.result) > 2000:
+                    result_text += (
+                        f"\n… ({len(tool.result) - 2000} chars truncated"
+                        f" · ctrl+o to expand)"
+                    )
             # Claude Code shows tool results with a ⎿ prefix
             cls = "tool-result-error" if tool.is_error else "tool-result-success"
             yield Static(
@@ -259,21 +347,73 @@ class ToolPanel(Widget):
         self._tool.is_running = running
         self.refresh(recompose=True)
 
-    @staticmethod
-    def _summarise_args(input_dict: dict) -> str:
-        """One-line summary of tool arguments."""
+    def set_verbose(self, verbose: bool) -> None:
+        if self._verbose != verbose:
+            self._verbose = verbose
+            self.refresh(recompose=True)
+
+    def _render_edit_result(self) -> tuple[str, str]:
+        """FileEditToolResultMessage: '(Updated <file> with N additions and
+        M removals', word-level diff markup). Diff capped at 12 rows unless
+        ctrl+o verbose."""
+        from optimus.tui.components.diff import build_patch_lines, format_structured_diff  # noqa: PLC0415
+        old = self._tool.input["old_string"]
+        new = self._tool.input["new_string"]
+        path = self._summarise_args(self._tool.input, self._tool.name) or "file"
+        patch_lines, old_start = build_patch_lines(old, new)
+        additions = sum(1 for l in patch_lines if l.startswith("+"))
+        removals = sum(1 for l in patch_lines if l.startswith("-"))
+
+        def plural(n: int, word: str) -> str:
+            return f"{n} {word}{'' if n == 1 else 's'}"
+
+        summary = (f"Updated {path} with {plural(additions, 'addition')} "
+                   f"and {plural(removals, 'removal')}")
+        rows = format_structured_diff(patch_lines, old_start, width=68)
+        if not self._verbose and len(rows) > 12:
+            rows = rows[:12] + [f"[#999999]… +{len(rows) - 12} lines (ctrl+o to expand)[/#999999]"]
+        return summary, "\n".join(rows)
+
+    # Primary display argument per tool — renderToolUseMessage shows just
+    # the meaningful value: Write(index.html), Bash(ls -la), Grep(pattern).
+    _PRIMARY_ARG = {
+        "Bash": "command", "PowerShell": "command",
+        "Read": "file_path", "FileRead": "file_path",
+        "Write": "file_path", "FileWrite": "file_path",
+        "Edit": "file_path", "FileEdit": "file_path",
+        "MultiEdit": "file_path", "NotebookEdit": "notebook_path",
+        "Glob": "pattern", "Grep": "pattern",
+        "WebFetch": "url", "WebSearch": "query",
+        "Agent": "description", "Skill": "skill",
+    }
+
+    @classmethod
+    def _summarise_args(cls, input_dict: dict, tool_name: str = "") -> str:
+        """renderToolUseMessage-style one-line arg display: the primary
+        argument's bare value; file paths shortened relative to cwd."""
         if not input_dict:
             return ""
-        parts: list[str] = []
-        for key, val in list(input_dict.items())[:3]:
-            if isinstance(val, str):
-                short = val[:40].replace("\n", " ")
-                parts.append(f"{key}={short!r}")
-            elif isinstance(val, (int, float, bool)):
-                parts.append(f"{key}={val}")
-            else:
-                parts.append(f"{key}=…")
-        return "  ".join(parts)
+        key = cls._PRIMARY_ARG.get(tool_name)
+        val = input_dict.get(key) if key else None
+        if val is None:
+            # Fall back to the first string value
+            for v in input_dict.values():
+                if isinstance(v, str) and v:
+                    val = v
+                    break
+        if not isinstance(val, str):
+            return ""
+        # Relativise absolute paths against cwd (renderToolUseMessage shows
+        # relative paths in the transcript)
+        if key and "path" in key:
+            try:
+                cwd = os.getcwd()
+                if val.lower().startswith(cwd.lower()):
+                    val = val[len(cwd):].lstrip("\\/")
+            except Exception:
+                pass
+        val = val.replace("\n", " ")
+        return val if len(val) <= 80 else val[:77] + "…"
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +488,27 @@ class MessageWidget(Widget):
         margin: 0 0 0 0;
         padding: 0 0 0 0;
     }
+    .bash-input-message {
+        background: #413c41;
+        padding: 0 1 0 0;
+        margin: 1 0 0 0;
+        height: auto;
+    }
+    .bash-output-message {
+        height: auto;
+        margin: 0;
+        padding: 0;
+    }
+    .compact-boundary-message {
+        height: auto;
+        margin: 1 0 1 0;
+        padding: 0;
+    }
+    .interrupted-message {
+        height: 1;
+        margin: 0;
+        padding: 0;
+    }
     """
 
     def __init__(self, message: MessageData, **kwargs) -> None:
@@ -402,24 +563,21 @@ class MessageWidget(Widget):
                                 id="streaming-text",
                             )
                         else:
-                            yield Markdown(msg.content, classes="message-assistant-content")
+                            # AssistantTextMessage.tsx switch(text): API-layer
+                            # sentinels render as dedicated error/interrupt
+                            # lines, not Markdown.
+                            special = render_special_assistant_text(msg.content)
+                            if special == "":
+                                pass  # NO_RESPONSE_REQUESTED → render nothing
+                            elif special is not None:
+                                yield Static(special, classes="message-assistant-content")
+                            else:
+                                yield Markdown(msg.content, classes="message-assistant-content")
 
-                    elif msg.is_streaming and not msg.tool_calls:
-                        # Waiting for first token or tool — show Thinking… spinner
-                        self._thinking_shown = True
-                        with Horizontal(classes="thinking-row"):
-                            yield Spinner()
-                            yield Static(
-                                "Thinking…",
-                                classes="thinking-label",
-                            )
-
-                    elif msg.is_streaming:
-                        # No text yet but tools are running — cursor
-                        yield Static(
-                            f"[blink bold {ACCENT}]▋[/]",
-                            classes="message-assistant-content",
-                        )
+                    # No content yet while streaming: render nothing. The
+                    # loading state is the SpinnerLine below the message list
+                    # (SpinnerWithVerb) — AssistantTextMessage renders null
+                    # for empty text (isEmptyMessageText → null).
 
         elif msg.role == "system":
             yield Static(
@@ -431,6 +589,48 @@ class MessageWidget(Widget):
             yield Static(
                 f"[bold #ff6b80]✗[/bold #ff6b80] {msg.content}",
                 classes="error-message",
+            )
+
+        elif msg.role == "bash-input":
+            # UserBashInputMessage.tsx: "! " prefix in bashBorder pink on the
+            # bash message background, paddingRight 1.
+            yield Static(
+                f"[#fd5db1]! [/#fd5db1][#ffffff]{msg.content}[/#ffffff]",
+                classes="bash-input-message",
+            )
+
+        elif msg.role == "bash-output":
+            # UserBashOutputMessage.tsx → BashToolResultMessage: stdout plain,
+            # stderr in error colour, both dimmed and truncated when long.
+            stdout = extract_tag(msg.content, "bash-stdout")
+            stderr = extract_tag(msg.content, "bash-stderr")
+            if stdout is None and stderr is None:
+                stdout = msg.content
+            parts: list[str] = []
+            if stdout and stdout.strip():
+                out = stdout.strip()
+                lines = out.splitlines()
+                if len(lines) > 10:
+                    out = "\n".join(lines[:10]) + f"\n… +{len(lines) - 10} lines"
+                parts.append(f"[#999999]{out}[/#999999]")
+            if stderr and stderr.strip():
+                parts.append(f"[#ff6b80]{stderr.strip()}[/#ff6b80]")
+            if not parts:
+                parts.append("[#999999](no output)[/#999999]")
+            yield Static("\n".join(parts), classes="bash-output-message")
+
+        elif msg.role == "compact-boundary":
+            # CompactBoundaryMessage.tsx
+            yield Static(
+                "[#999999]✻ Conversation compacted (ctrl+o for history)[/#999999]",
+                classes="compact-boundary-message",
+            )
+
+        elif msg.role == "interrupted":
+            # InterruptedByUser.tsx
+            yield Static(
+                "[#999999]Interrupted · What should Optimus do instead?[/#999999]",
+                classes="interrupted-message",
             )
 
     # ------------------------------------------------------------------
@@ -625,8 +825,43 @@ class MessageList(VerticalScroll):
         self._scroll_to_bottom()
         return widget
 
+    def _add_simple(self, role: str, content: str = "", classes: str = "") -> MessageWidget:
+        msg = MessageData(role=role, content=content)
+        widget = MessageWidget(msg, classes=classes or f"message-{role}")
+        self._messages.append(widget)
+        container = self.query_one("#message-container")
+        container.mount(widget)
+        self._scroll_to_bottom()
+        return widget
+
+    def add_bash_input(self, command: str) -> MessageWidget:
+        """UserBashInputMessage — the '! command' echo for bash-mode input."""
+        return self._add_simple("bash-input", command)
+
+    def add_bash_output(self, content: str) -> MessageWidget:
+        """UserBashOutputMessage — stdout/stderr of a bash-mode command."""
+        return self._add_simple("bash-output", content)
+
+    def add_compact_boundary(self) -> MessageWidget:
+        """CompactBoundaryMessage — '✻ Conversation compacted' divider."""
+        return self._add_simple("compact-boundary")
+
+    def add_interrupted(self) -> MessageWidget:
+        """InterruptedByUser — dim 'Interrupted · …' line after Esc/Ctrl+C."""
+        return self._add_simple("interrupted")
+
     def get_current_assistant(self) -> Optional[MessageWidget]:
         return self._current_assistant_widget
+
+    # ------------------------------------------------------------------
+    # ctrl+o — toggle full tool output on every ToolPanel (CtrlOToExpand)
+    # ------------------------------------------------------------------
+
+    def toggle_verbose(self) -> bool:
+        self._verbose_output = not getattr(self, "_verbose_output", False)
+        for panel in self.query(ToolPanel):
+            panel.set_verbose(self._verbose_output)
+        return self._verbose_output
 
     def clear_messages(self) -> None:
         """Remove all messages from the list."""

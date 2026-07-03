@@ -6,6 +6,6 @@
 # both spellings resolve to the same module object.
 import sys as _sys
 
-from optimus import tool as _tool_module
+from optimus import Tool as _tool_module
 
 _sys.modules.setdefault("optimus.tool", _tool_module)

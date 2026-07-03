@@ -51,6 +51,7 @@ SLASH_COMMANDS: list[SlashCommand] = [
     SlashCommand("/model",          "Switch model",                             ["/m"]),
     SlashCommand("/effort",         "Set effort level: low|medium|high|max",    []),
     SlashCommand("/output-style",   "Change output style: verbose|concise|auto",[]),
+    SlashCommand("/theme",          "List or switch colour theme",              []),
     # ── Context / memory ──────────────────────────────────────────────────
     SlashCommand("/context",        "Show context window usage",                []),
     SlashCommand("/memory",         "Show or edit memory files",                []),
@@ -96,8 +97,26 @@ class InputSubmitted(TMessage):
         self.text = text
 
 
+class BashInputSubmitted(TMessage):
+    """Posted when the user submits a bash-mode command ('!cmd')."""
+    def __init__(self, command: str) -> None:
+        super().__init__()
+        self.command = command
+
+
 class CancelRequested(TMessage):
     """Posted when the user presses Ctrl+C or Escape."""
+
+
+class PermissionModeChanged(TMessage):
+    """Posted when shift+tab cycles the permission mode."""
+    def __init__(self, mode: str) -> None:
+        super().__init__()
+        self.mode = mode
+
+
+class ExitRequested(TMessage):
+    """Posted on the second ctrl+c/ctrl+d press within the exit window."""
 
 
 class SlashInputChanged(TMessage):
@@ -109,6 +128,58 @@ class SlashInputChanged(TMessage):
     def __init__(self, value: str) -> None:
         super().__init__()
         self.value = value
+
+
+class MentionInputChanged(TMessage):
+    """
+    Posted while the trailing token of the input is an '@path' file mention.
+    prefix is the partial path after '@'; None means no active mention.
+    """
+    def __init__(self, prefix: Optional[str]) -> None:
+        super().__init__()
+        self.prefix = prefix
+
+
+# ---------------------------------------------------------------------------
+# @-mention file completion — port of the unified-suggestions file source
+# (utils/suggestions directoryCompletion): complete paths relative to cwd,
+# directories suffixed with '/', hidden entries only when the typed segment
+# starts with '.'.
+# ---------------------------------------------------------------------------
+
+def complete_file_paths(prefix: str, cwd: Optional[str] = None, limit: int = 13) -> list[str]:
+    import os
+    base_dir = cwd or os.getcwd()
+    # Split the typed prefix into directory part + partial name
+    prefix = prefix.replace("\\", "/")
+    if "/" in prefix:
+        dir_part, _, name_part = prefix.rpartition("/")
+        search_dir = os.path.join(base_dir, dir_part)
+        rel_prefix = dir_part + "/"
+    else:
+        dir_part, name_part = "", prefix
+        search_dir = base_dir
+        rel_prefix = ""
+    try:
+        entries = sorted(os.scandir(search_dir), key=lambda e: e.name.lower())
+    except OSError:
+        return []
+    show_hidden = name_part.startswith(".")
+    out: list[str] = []
+    for entry in entries:
+        name = entry.name
+        if not show_hidden and name.startswith("."):
+            continue
+        if not name.lower().startswith(name_part.lower()):
+            continue
+        try:
+            is_dir = entry.is_dir()
+        except OSError:
+            is_dir = False
+        out.append(rel_prefix + name + ("/" if is_dir else ""))
+        if len(out) >= limit:
+            break
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +302,7 @@ class SlashOverlay(Widget):
     def update(self, prefix: str) -> None:
         """Filter commands matching *prefix* and redisplay."""
         self._prefix = prefix
+        self._kind = "slash"
         pl = prefix.lower()
         self._items = [
             cmd for cmd in SLASH_COMMANDS
@@ -244,10 +316,29 @@ class SlashOverlay(Widget):
             self.remove_class("visible")
         self.refresh(recompose=True)
 
+    def update_mentions(self, prefix: str, completions: list[str]) -> None:
+        """Show @-mention file completions (unified-suggestions file source).
+        Items reuse the SlashCommand rendering: name = completion path."""
+        self._prefix = ""            # no typed-prefix highlight for paths
+        self._kind = "mention"
+        self._items = [
+            SlashCommand(name=c, description="", aliases=[]) for c in completions
+        ]
+        self._selected = min(self._selected, max(0, len(self._items) - 1))
+        if self._items:
+            self.add_class("visible")
+        else:
+            self.remove_class("visible")
+        self.refresh(recompose=True)
+
+    def get_kind(self) -> str:
+        return getattr(self, "_kind", "slash")
+
     def hide(self) -> None:
         self._items = []
         self._selected = 0
         self._prefix = ""
+        self._kind = "slash"
         self.remove_class("visible")
         self.refresh(recompose=True)
 
@@ -270,17 +361,41 @@ class SlashOverlay(Widget):
 # InputBar — main input widget (no longer owns the slash overlay)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Permission-mode config — port of utils/permissions/PermissionMode.ts
+# PERMISSION_MODE_CONFIG (title/symbol/color per mode). shift+tab cycles
+# default → acceptEdits → plan → default.
+# ---------------------------------------------------------------------------
+
+PAUSE_ICON = "⏸"  # constants/figures.ts PAUSE_ICON
+
+PERMISSION_MODE_CONFIG: dict[str, dict] = {
+    "default":           {"title": "Default",            "symbol": "",         "color": "#ffffff"},
+    "plan":              {"title": "Plan Mode",          "symbol": PAUSE_ICON, "color": "#48968c"},   # planMode
+    "acceptEdits":       {"title": "Accept edits",       "symbol": "⏵⏵",       "color": "#af87ff"},   # autoAccept
+    "bypassPermissions": {"title": "Bypass Permissions", "symbol": "⏵⏵",       "color": "#ff6b80"},   # error
+}
+
+_MODE_CYCLE = ["default", "acceptEdits", "plan"]
+
+
 class InputBar(Widget):
     """
     The bottom input bar.  Handles text entry, history, and key routing.
     The slash-command overlay is owned by the parent Screen — InputBar
     communicates with it via SlashInputChanged messages and reads it
     back through self.screen.
+
+    Footer row (PromptInputFooterLeftSide):
+      - bash mode:            "! for bash mode" in bashBorder pink
+      - active mode:          "⏵⏵ accept edits on (shift+tab to cycle)"
+      - exit confirm pending: "Press ctrl+c again to exit"
+      - otherwise:            "? for shortcuts" (dim)
     """
 
     DEFAULT_CSS = """
     InputBar {
-        height: 4;
+        height: 5;
         background: #1a1a1a;
         border-top: solid #888888;
         layout: vertical;
@@ -298,6 +413,12 @@ class InputBar(Widget):
         color: #d77757;
         content-align: left middle;
         background: #1a1a1a;
+    }
+    InputBar #input-footer {
+        height: 1;
+        padding: 0 2;
+        background: #1a1a1a;
+        color: #999999;
     }
     InputBar Input {
         border: none;
@@ -324,6 +445,14 @@ class InputBar(Widget):
     """.replace("#d77757", ACCENT)
 
     is_waiting: reactive[bool] = reactive(False)
+    permission_mode: reactive[str] = reactive("default")
+
+    # Focusable so ctrl+r search can steal focus from the Input — the Input
+    # consumes printable keys itself, so query keystrokes must land here.
+    can_focus = True
+
+    # Exit-confirm window (ExitFlow): second ctrl+c within 2 s exits
+    _EXIT_WINDOW_S = 2.0
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -331,6 +460,15 @@ class InputBar(Widget):
         self._history_pos: int = -1
         self._saved_input: str = ""
         self._vim_mode: bool = False
+        self._exit_pending_at: float = 0.0
+        self._exit_reset_timer = None
+        # Ctrl+R reverse history search (isSearchingHistory / historyQuery /
+        # historyFailedMatch in PromptInput.tsx)
+        self._searching: bool = False
+        self._search_query: str = ""
+        self._search_skip: int = 0        # ctrl+r again → next older match
+        self._search_failed: bool = False
+        self._saved_before_search: str = ""
 
     def compose(self) -> ComposeResult:
         # SlashOverlay is NOT here — it lives on the parent Screen
@@ -340,6 +478,109 @@ class InputBar(Widget):
                 placeholder=f"Talk to {NAME} (/? for help)",
                 id="input-field",
             )
+        yield Static(self._footer_markup(), id="input-footer")
+
+    # ------------------------------------------------------------------
+    # Footer — PromptInputFooterLeftSide
+    # ------------------------------------------------------------------
+
+    def _footer_markup(self) -> str:
+        import time as _t
+        # History search label (HistorySearchInput): shows the live query;
+        # "no matching prompt:" when nothing in history matches.
+        if self._searching:
+            label = "no matching prompt:" if self._search_failed else "search prompts:"
+            return f"[#999999]{label}[/#999999] {self._search_query}"
+        # Exit-confirm message wins over everything else (exitMessage.show)
+        if self._exit_pending_at and (_t.monotonic() - self._exit_pending_at) < self._EXIT_WINDOW_S:
+            return "[#999999]Press ctrl+c again to exit[/#999999]"
+        # Bash mode: input starts with "!"
+        try:
+            if self.query_one("#input-field", Input).value.startswith("!"):
+                return "[#fd5db1]! for bash mode[/#fd5db1]"
+        except Exception:
+            pass
+        # Active permission mode indicator
+        if self.permission_mode != "default":
+            cfg = PERMISSION_MODE_CONFIG.get(self.permission_mode, PERMISSION_MODE_CONFIG["default"])
+            c = cfg["color"]
+            return (f"[{c}]{cfg['symbol']} {cfg['title'].lower()} on[/{c}]"
+                    f" [#505050](shift+tab to cycle)[/#505050]")
+        return "[#505050]? for shortcuts[/#505050]"
+
+    def _refresh_footer(self) -> None:
+        try:
+            self.query_one("#input-footer", Static).update(self._footer_markup())
+        except Exception:
+            pass
+
+    def watch_permission_mode(self, value: str) -> None:
+        self._refresh_footer()
+
+    # ------------------------------------------------------------------
+    # Ctrl+R reverse history search
+    # ------------------------------------------------------------------
+
+    def _find_history_match(self) -> Optional[str]:
+        """Newest-first substring match (case-insensitive), skipping
+        _search_skip earlier matches (ctrl+r cycling)."""
+        if not self._search_query:
+            return None
+        q = self._search_query.lower()
+        skip = self._search_skip
+        for entry in reversed(self._history):
+            if q in entry.lower():
+                if skip == 0:
+                    return entry
+                skip -= 1
+        return None
+
+    def _update_search(self) -> None:
+        field = self.query_one("#input-field", Input)
+        match = self._find_history_match()
+        if match is not None:
+            self._search_failed = False
+            field.value = match
+            field.cursor_position = len(match)
+        else:
+            self._search_failed = bool(self._search_query)
+        self._refresh_footer()
+
+    def _start_search(self) -> None:
+        field = self.query_one("#input-field", Input)
+        self._searching = True
+        self._search_query = ""
+        self._search_skip = 0
+        self._search_failed = False
+        self._saved_before_search = field.value
+        # Take focus away from the Input: it consumes printable keys, so the
+        # search query is typed against this widget's on_key instead
+        # (PromptInput.tsx: focus={!isSearchingHistory}).
+        self.focus()
+        self._refresh_footer()
+
+    def _end_search(self, accept: bool) -> None:
+        """Accept keeps the matched text in the input; cancel restores what
+        the user had typed before ctrl+r."""
+        field = self.query_one("#input-field", Input)
+        if not accept:
+            field.value = self._saved_before_search
+        field.cursor_position = len(field.value)
+        self._searching = False
+        self._search_query = ""
+        self._search_skip = 0
+        self._search_failed = False
+        field.focus()
+        self._refresh_footer()
+
+    def cycle_permission_mode(self) -> None:
+        """shift+tab: default → acceptEdits → plan → default."""
+        try:
+            idx = _MODE_CYCLE.index(self.permission_mode)
+        except ValueError:
+            idx = 0
+        self.permission_mode = _MODE_CYCLE[(idx + 1) % len(_MODE_CYCLE)]
+        self.post_message(PermissionModeChanged(self.permission_mode))
 
     # ------------------------------------------------------------------
     # Overlay accessor — safe reference to the screen-level overlay
@@ -365,6 +606,12 @@ class InputBar(Widget):
         else:
             prefix.update(f"[bold {ACCENT}]>[/] ")
             field.focus()
+        self._refresh_footer()
+
+    def _clear_exit_pending(self) -> None:
+        self._exit_pending_at = 0.0
+        self._exit_reset_timer = None
+        self._refresh_footer()
 
     def clear_input(self) -> None:
         self.query_one("#input-field", Input).value = ""
@@ -395,31 +642,134 @@ class InputBar(Widget):
         self.query_one("#input-field", Input).value = ""
         # Signal overlay gone
         self.post_message(SlashInputChanged(""))
-        self.post_message(InputSubmitted(text))
+        # Bash mode: "!command" runs directly in the shell (PromptInput
+        # mode === 'bash'), it is not sent to the model.
+        if text.startswith("!") and len(text) > 1:
+            self.post_message(BashInputSubmitted(text[1:].strip()))
+        else:
+            self.post_message(InputSubmitted(text))
 
     @on(Input.Changed, "#input-field")
     def handle_change(self, event: Input.Changed) -> None:
         val = event.value
+        # suppressSuggestions while searching history — programmatic value
+        # updates from the search match must not pop the overlay.
+        if self._searching:
+            return
         if val.startswith("/") and " " not in val:
             self.post_message(SlashInputChanged(val))
+            self.post_message(MentionInputChanged(None))
         else:
             self.post_message(SlashInputChanged(""))
+            # @-mention: trailing token starting with '@' opens file completion
+            token = val.rsplit(" ", 1)[-1] if val else ""
+            if token.startswith("@") and not self.is_waiting:
+                self.post_message(MentionInputChanged(token[1:]))
+            else:
+                self.post_message(MentionInputChanged(None))
+        self._refresh_footer()   # bash-mode "!" hint tracks the input live
+
+    def insert_mention_completion(self, completion: str) -> None:
+        """Replace the trailing '@token' with '@completion' (plus a trailing
+        space for files so the user keeps typing; directories stay open for
+        deeper completion)."""
+        field = self.query_one("#input-field", Input)
+        val = field.value
+        head, sep, _token = val.rpartition(" ")
+        prefix = head + sep if sep else ""
+        suffix = "" if completion.endswith("/") else " "
+        field.value = f"{prefix}@{completion}{suffix}"
+        field.cursor_position = len(field.value)
 
     # ------------------------------------------------------------------
     # Key routing
     # ------------------------------------------------------------------
 
     def on_key(self, event: events.Key) -> None:
+        import time as _t
         field = self.query_one("#input-field", Input)
         ov = self._overlay()
         overlay_open = ov is not None and ov.is_visible()
 
-        # ── Ctrl+C — cancel ──────────────────────────────────────────────
+        # ── Ctrl+R — start / cycle reverse history search ────────────────
+        if event.key == "ctrl+r" and not self.is_waiting:
+            event.stop()
+            if self._searching:
+                # cycle to next older match
+                self._search_skip += 1
+                if self._find_history_match() is None and self._search_skip > 0:
+                    self._search_skip -= 1   # stay on the oldest match
+                self._update_search()
+            else:
+                self._start_search()
+            return
+
+        # ── While searching, keys edit the query, not the input ─────────
+        if self._searching:
+            key = event.key
+            if key == "escape":
+                event.stop()
+                self._end_search(accept=False)
+                return
+            if key == "enter":
+                event.stop()
+                self._end_search(accept=True)
+                return
+            if key == "backspace":
+                event.stop()
+                self._search_query = self._search_query[:-1]
+                self._search_skip = 0
+                if not self._search_query:
+                    self._search_failed = False
+                self._update_search()
+                return
+            if event.is_printable and event.character:
+                event.stop()
+                self._search_query += event.character
+                self._search_skip = 0
+                self._update_search()
+                return
+            # Navigation keys accept the current match and fall through
+            if key in ("up", "down", "left", "right", "home", "end"):
+                self._end_search(accept=True)
+            # anything else: leave search silently
+            else:
+                self._end_search(accept=True)
+                return
+
+        # ── Shift+Tab — cycle permission mode ────────────────────────────
+        if event.key == "shift+tab":
+            event.stop()
+            self.cycle_permission_mode()
+            return
+
+        # ── Ctrl+C — cancel query, or double-press to exit when idle ────
         if event.key == "ctrl+c":
             event.stop()
             if ov:
                 ov.hide()
-            self.post_message(CancelRequested())
+            if self.is_waiting or field.value:
+                # Cancel the running query / clear typed input first
+                self._exit_pending_at = 0.0
+                self.post_message(CancelRequested())
+                self._refresh_footer()
+                return
+            # Idle with empty input — ExitFlow: first press arms the
+            # 2 s window, second press exits.
+            now = _t.monotonic()
+            if self._exit_pending_at and (now - self._exit_pending_at) < self._EXIT_WINDOW_S:
+                self.post_message(ExitRequested())
+                return
+            self._exit_pending_at = now
+            self._refresh_footer()
+            if self._exit_reset_timer is not None:
+                try:
+                    self._exit_reset_timer.stop()
+                except Exception:
+                    pass
+            self._exit_reset_timer = self.set_timer(
+                self._EXIT_WINDOW_S, self._clear_exit_pending
+            )
             return
 
         # ── Escape — close overlay or cancel ─────────────────────────────
@@ -470,10 +820,17 @@ class InputBar(Widget):
                 event.stop()
                 selected = ov.get_selected()
                 if selected:
-                    field.value = selected + " "
-                    field.cursor_position = len(field.value)
-                    ov.hide()
-                    self.post_message(SlashInputChanged(""))
+                    if ov.get_kind() == "mention":
+                        self.insert_mention_completion(selected)
+                        # Directory completions keep the overlay open one
+                        # level deeper; Input.Changed re-triggers it.
+                        if not selected.endswith("/"):
+                            ov.hide()
+                    else:
+                        field.value = selected + " "
+                        field.cursor_position = len(field.value)
+                        ov.hide()
+                        self.post_message(SlashInputChanged(""))
             return
 
         # ── Enter with overlay open — pick selected item ──────────────────
@@ -481,6 +838,11 @@ class InputBar(Widget):
             selected = ov.get_selected()
             if selected:
                 event.stop()
+                if ov.get_kind() == "mention":
+                    self.insert_mention_completion(selected)
+                    if not selected.endswith("/"):
+                        ov.hide()
+                    return
                 ov.hide()
                 self.post_message(SlashInputChanged(""))
                 field.value = ""

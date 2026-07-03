@@ -329,95 +329,11 @@ SlashOverlay .slash-item--selected .slash-name {
 }
 
 /* ── Permission dialog ───────────────────────────────────────── */
+/* Widget-local layout lives in PermissionModal.DEFAULT_CSS (permission.py) —
+   this only sets the modal layer so it floats above the message list. */
 PermissionModal {
     align: center middle;
     layer: overlay;
-}
-
-DangerousPermissionModal {
-    align: center middle;
-    layer: overlay;
-}
-
-#permission-container {
-    background: #262626;
-    border: double #b1b9f9;
-    width: 70;
-    max-width: 90%;
-    height: auto;
-    max-height: 30;
-    padding: 1 2;
-}
-
-#permission-title {
-    color: #b1b9f9;
-    text-style: bold;
-    text-align: center;
-    margin-bottom: 1;
-}
-
-#permission-tool {
-    color: #d77757;
-    text-style: bold;
-    margin-bottom: 0;
-}
-
-#permission-description {
-    color: #ffffff;
-    margin-bottom: 1;
-}
-
-#permission-content {
-    background: #413c41;
-    border: solid #505050;
-    color: #999999;
-    padding: 0 1;
-    margin-bottom: 1;
-    max-height: 8;
-    overflow-y: auto;
-}
-
-#permission-buttons {
-    layout: horizontal;
-    height: 3;
-    align: center middle;
-}
-
-#permission-buttons Button {
-    margin: 0 1;
-    min-width: 12;
-}
-
-#btn-allow {
-    background: #4eba65;
-    color: #000000;
-    border: none;
-}
-
-#btn-allow:hover {
-    background: #5acc75;
-}
-
-#btn-allow-session {
-    background: #264f78;
-    color: #ffffff;
-    border: none;
-}
-
-#btn-allow-session:hover {
-    background: #b1b9f9;
-    color: #000000;
-}
-
-#btn-deny {
-    background: #2a0a0e;
-    color: #ff6b80;
-    border: solid #ff6b80;
-}
-
-#btn-deny:hover {
-    background: #ff6b80;
-    color: #000000;
 }
 
 /* ── Error / system messages ─────────────────────────────────── */
